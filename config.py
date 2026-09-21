@@ -20,7 +20,7 @@ EMBED_COLOR_DARK = 0x1A1A1A  # near-black, secondary accent
 FOOTER_TEXT = "Rosarium"
 
 # --- Behavior ---
-COMMAND_PREFIX = "$"  # only used if you ever add prefix commands alongside slash commands
+COMMAND_PREFIX = "$"  # only used iif you ever add prefix commands alongside slash commands
 STATUS_MESSAGE = "over the garden of thorns"  # shown as "Watching ..."
 
 # Channel ID where .quote posts generated quote cards. Set QUOTE_CHANNEL_ID
