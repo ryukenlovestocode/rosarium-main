@@ -14,7 +14,7 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 OWNER_IDS = [int(x) for x in os.getenv("OWNER_IDS", "").split(",") if x.strip()]
 
 # --- Branding ---
-BOT_NAME = "Rosarium"
+BOT_NAME = "Roselle"
 EMBED_COLOR = 0x8B0000       # deep blood red, primary accent
 EMBED_COLOR_DARK = 0x1A1A1A  # near-black, secondary accent
 FOOTER_TEXT = "Rosarium"
