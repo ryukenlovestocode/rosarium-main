@@ -3,7 +3,8 @@ Help cog — the paginated command index for Rosarium.
 
 Rewritten from the Luna-era version:
   - Every page is built from the commands that actually exist in this
-    bot's cogs (general, utility, fun, economy, moderation, welcomer).
+    bot's cogs (general, utility, fun, economy, moderation, welcomer,
+    embed_builder, reaction_roles, autorole).
     Luna's AI / Statistics / Clans pages and her personality commands
     (fortune, cosmic, prophecy, 8ball, roast…) are gone, since nothing
     in this project implements them.
@@ -20,6 +21,11 @@ category, each a title, a short blurb, and a list of (section, body)
 fields. Add a command by editing the relevant body string. 🔒 marks an
 owner-only command; ⛓️ tiers inside Moderation mirror the role checks
 in moderation.py (🔴 Mod or owner, 🟡 Trial Mod and above).
+
+The Server Setup page covers the slash-only configuration commands
+(/embed, /reactionrole, /autorole, /leavelog). Those are gated by Discord
+permissions (Manage Messages / Manage Roles / Manage Server) rather than
+by staff roles, so each field header names the permission it needs.
 """
 
 from __future__ import annotations
@@ -81,17 +87,20 @@ def build_pages(bot: commands.Bot) -> list[Page]:
                 f"🌹 **Economy** {DIV} petals, daily, pay, leaderboard\n"
                 f"🎲 **Casino** {DIV} coinflip, dice, wheel, fish, slots, blackjack, rob\n"
                 f"⛓️ **Moderation** {DIV} staff tools, warnings, roles\n"
+                f"🛠️ **Server Setup** {DIV} embeds, reaction roles, autorole, leave log\n"
                 f"🔒 **Owner** {DIV} restart, sticky messages, testing",
             ),
             (
                 "⚡  Quick jump",
                 f"`{p}help general` · `{p}help utility` · `{p}help fun`\n"
-                f"`{p}help economy` · `{p}help casino` · `{p}help mod` · `{p}help owner`",
+                f"`{p}help economy` · `{p}help casino` · `{p}help mod`\n"
+                f"`{p}help setup` · `{p}help owner`",
             ),
             (
                 "🔖  Reading the pages",
                 f"`<required>` · `[optional]` · 🔒 owner only\n"
-                f"🔴 Mod or owner · 🟡 Trial Mod and above",
+                f"🔴 Mod or owner · 🟡 Trial Mod and above\n"
+                f"🛠️ Server Setup commands are **slash-only** (`/`)",
             ),
         ],
     )
@@ -300,6 +309,59 @@ def build_pages(bot: commands.Bot) -> list[Page]:
         ],
     )
 
+    setup = Page(
+        key="setup",
+        label="Server Setup",
+        emoji="🛠️",
+        title="Server Setup",
+        blurb=(
+            "> Embeds, reaction roles, autorole, and leave messages.\n"
+            "> **Slash commands only** — each needs the Discord permission in its header."
+        ),
+        color=ROSE,
+        fields=[
+            (
+                "🎨  Embed builder · Manage Messages",
+                "`/embed create` " + DIV + " open the builder form (title, description, color, image/GIF, thumbnail)\n"
+                "`/embed footer` " + DIV + " set the footer text and small icon\n"
+                "`/embed preview` " + DIV + " see your current draft (only you can see it)\n"
+                "`/embed send <channel> [content]` " + DIV + " post the draft\n"
+                "`/embed edit <message_id> [channel]` " + DIV + " replace one of Rosarium's messages with your draft\n"
+                "`/embed reset` " + DIV + " clear your draft\n"
+                "┣ Custom emoji work anywhere as `<a:name:id>` or `<:name:id>`\n"
+                "┣ GIFs animate in the **image** slot, not the footer\n"
+                "┗ *Drafts are in-memory — a restart clears them.*",
+            ),
+            (
+                "🌷  Reaction roles · Manage Roles",
+                "`/reactionrole create <channel> [title] [description]` " + DIV + " post a new panel\n"
+                "`/reactionrole add <message_id> <emoji> <@role> [channel]` " + DIV + " bind an emoji to a role\n"
+                "`/reactionrole addmany <message_id> [channel]` " + DIV + " form for several `emoji role` pairs, one per line\n"
+                "`/reactionrole remove <message_id> <emoji> [channel]` " + DIV + " unbind an emoji\n"
+                "`/reactionrole list [message_id]` " + DIV + " show bindings for one panel or the whole server\n"
+                "`/reactionrole delete <message_id>` " + DIV + " wipe a panel's bindings\n"
+                "┣ React to get the role, un-react to lose it\n"
+                "┗ *`delete` leaves the message itself alone. Rosarium's top role must sit above every bound role.*",
+            ),
+            (
+                "🌱  Autorole · Manage Roles",
+                "`/autorole set <@role>` " + DIV + " give this role to every new member\n"
+                "`/autorole disable` " + DIV + " turn autorole off\n"
+                "`/autorole status` " + DIV + " show the current role and log channel\n"
+                "`/autorole log set <#channel>` " + DIV + " post a note there each time a role is assigned\n"
+                "`/autorole log disable` " + DIV + " stop those notes\n"
+                "┗ *Bots are skipped. Failed assignments (deleted role, missing permissions) are reported to the log channel too.*",
+            ),
+            (
+                "👋  Leave messages · Manage Server",
+                "`/leavelog set <#channel>` " + DIV + " post a goodbye embed there whenever someone leaves\n"
+                "`/leavelog disable` " + DIV + " turn it off\n"
+                "`/leavelog status` " + DIV + " show the current channel\n"
+                "┗ *Shows who left, when they joined, and their roles. Welcome messages post automatically to the welcome channel set in `.env`.*",
+            ),
+        ],
+    )
+
     owner = Page(
         key="owner",
         label="Owner",
@@ -328,7 +390,7 @@ def build_pages(bot: commands.Bot) -> list[Page]:
         ],
     )
 
-    return [index, general, utility, fun, economy, casino, moderation, owner]
+    return [index, general, utility, fun, economy, casino, moderation, setup, owner]
 
 
 # Accepted arguments for `.help <section>` → page key.
@@ -349,6 +411,17 @@ CATEGORY_ALIASES = {
     "moderation": "moderation",
     "mod": "moderation",
     "staff": "moderation",
+    "setup": "setup",
+    "server": "setup",
+    "config": "setup",
+    "embed": "setup",
+    "embeds": "setup",
+    "reactionrole": "setup",
+    "reactionroles": "setup",
+    "rr": "setup",
+    "autorole": "setup",
+    "welcome": "setup",
+    "leave": "setup",
     "owner": "owner",
 }
 
