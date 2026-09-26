@@ -93,6 +93,14 @@ HEX_COLOR_RE = re.compile(r"^#?[0-9a-fA-F]{6}$")
 # creeps up over the bot's lifetime).
 CUSTOM_EMOJI_RE = re.compile(r"^<(?P<animated>a)?:(?P<name>[a-zA-Z0-9_]{2,32}):(?P<id>[0-9]{15,21})>$")
 
+# Zero-width space/joiner/non-joiner, left/right-to-left marks, and the
+# BOM / zero-width no-break space. Mobile keyboards and some copy-paste
+# paths (especially copying a rendered emoji rather than typing it) can
+# smuggle one of these in right next to the visible characters. .strip()
+# only removes real whitespace, so left alone these silently break the
+# "^...$" regex match below even though the string looks identical.
+INVISIBLE_CHARS_RE = re.compile(r"[\u200b\u200c\u200d\u200e\u200f\ufeff]")
+
 
 async def resolve_emoji(guild: discord.Guild, raw: str) -> Optional[discord.PartialEmoji]:
     """Parse user input into a PartialEmoji: handles unicode emoji, the
@@ -100,7 +108,7 @@ async def resolve_emoji(guild: discord.Guild, raw: str) -> Optional[discord.Part
     emoji ID. Same parsing rules as reaction_roles.py's resolve_emoji —
     duplicated locally (not imported) so this cog has no dependency on
     reaction_roles.py being loaded."""
-    raw = raw.strip()
+    raw = INVISIBLE_CHARS_RE.sub("", raw).strip()
 
     # Full custom emoji format: <:name:id> or <a:name:id>
     if raw.startswith("<") and raw.endswith(">"):
@@ -203,6 +211,46 @@ def _shop_embed(title: str, description: str = "", color: Optional[int] = None) 
     return embed
 
 
+class ReactorEmojiModal(discord.ui.Modal, title="Auto-Reactor Emoji"):
+    """The popup form for buying the auto-reactor without typing the emoji
+    inline. Submitting it hands control straight to
+    Shop.handle_reactor_modal_submit, which does the actual validate/charge/
+    save work — this class is just the UI shell."""
+
+    emoji_input: discord.ui.TextInput = discord.ui.TextInput(
+        label="Emoji",
+        placeholder="🔥  or a custom/animated emoji from any server I'm in",
+        max_length=100,
+        required=True,
+    )
+
+    def __init__(self, cog: "Shop") -> None:
+        super().__init__()
+        self.cog = cog
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await self.cog.handle_reactor_modal_submit(interaction, self.emoji_input.value)
+
+
+class ReactorBuyView(discord.ui.View):
+    """Shown only when `$servershop buy reactor` is invoked via the classic
+    "$" prefix with no emoji given. A modal can only be opened in direct
+    response to an Interaction, and a plain text message never has one —
+    this button exists purely to create the interaction a modal needs.
+    (Slash invocations skip this entirely and get the modal immediately —
+    see _buy_reactor.)"""
+
+    def __init__(self, cog: "Shop") -> None:
+        super().__init__(timeout=180)
+        self.cog = cog
+
+    @discord.ui.button(label="Enter Emoji", style=discord.ButtonStyle.primary, emoji="🔔")
+    async def enter_emoji(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await interaction.response.send_modal(ReactorEmojiModal(self.cog))
+
+
 class Shop(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
@@ -237,29 +285,39 @@ class Shop(commands.Cog):
             }
         return purchases[key]
 
+    def _try_charge(self, user_id: int, price: int) -> tuple[bool, Optional[str]]:
+        """Pure balance check + deduction, no messaging — returns
+        (success, error_message). Shared by the classic ctx-based `_charge`
+        below AND the modal/interaction-based reactor purchase flow, so both
+        speak the exact same economy logic without duplicating it (a modal
+        submission only ever hands us an Interaction, never a
+        commands.Context, so it can't call `_charge` directly)."""
+        economy = self._economy()
+        if economy is None:
+            return False, (
+                "The economy system isn't loaded right now — the shop can't "
+                "process payments. Try again later or tell an admin."
+            )
+
+        balance = economy.get_balance(user_id)
+        if price > balance:
+            return False, (
+                f"You need **{_fmt(price)}** for that, but you only have "
+                f"**{_fmt(balance)}**."
+            )
+
+        economy.set_balance(user_id, balance - price)
+        return True, None
+
     async def _charge(self, ctx: commands.Context, price: int) -> bool:
         """Checks balance and deducts `price` from ctx.author if they can
         afford it. Returns True on success, sends an error and returns
         False otherwise. Centralizing this ensures every item is charged
         the same way the economy cog's own `pay` command does it."""
-        economy = self._economy()
-        if economy is None:
-            await ctx.send(
-                "The economy system isn't loaded right now — the shop can't "
-                "process payments. Try again later or tell an admin."
-            )
-            return False
-
-        balance = economy.get_balance(ctx.author.id)
-        if price > balance:
-            await ctx.send(
-                f"You need **{_fmt(price)}** for that, but you only have "
-                f"**{_fmt(balance)}**."
-            )
-            return False
-
-        economy.set_balance(ctx.author.id, balance - price)
-        return True
+        ok, error = self._try_charge(ctx.author.id, price)
+        if not ok:
+            await ctx.send(error)
+        return ok
 
     def _role_assignable(self, guild: discord.Guild, role: discord.Role) -> Optional[str]:
         """Returns an error string if the bot can't assign this role, else None."""
@@ -467,15 +525,63 @@ class Shop(commands.Cog):
         )
         await ctx.send(embed=embed)
 
+    @staticmethod
+    def _reactor_precheck(record: dict, storage_value: str) -> Optional[str]:
+        """Shared 'already own it / hit the cap' check for the reactor
+        purchase flow, used by both the classic ctx-based path and the
+        modal/interaction-based one below."""
+        if storage_value in record["reactor_emojis"]:
+            return "You already have that reactor emoji."
+        if len(record["reactor_emojis"]) >= MAX_REACTOR_EMOJIS:
+            return (
+                f"You already have the max of {MAX_REACTOR_EMOJIS} reactor emojis. "
+                "Ask an admin to clear one first."
+            )
+        return None
+
+    @staticmethod
+    async def _test_reactor_emoji(message: discord.Message, parsed: discord.PartialEmoji) -> Optional[str]:
+        """Try reacting to `message` with `parsed` as a pre-charge sanity
+        check — cheap, immediate feedback if it's a custom emoji from a
+        server the bot can't access, BEFORE any money changes hands. Returns
+        None on success, or a user-facing error string on failure. Shared by
+        both the ctx-based and modal-based reactor purchase flows; only the
+        message they test against differs (the user's own invoking message
+        for the classic path, since there is one — a probe message we send
+        ourselves for the modal path, since a Modal submission never has one)."""
+        try:
+            if parsed.is_custom_emoji():
+                await message.add_reaction(parsed)
+            else:
+                await message.add_reaction(parsed.name)
+        except discord.HTTPException:
+            kind = "animated custom" if parsed.animated else "custom" if parsed.is_custom_emoji() else "unicode"
+            return (
+                f"I couldn't react with that {kind} emoji — it's likely from a "
+                "server I'm not in, or Discord rejected it. No charge was made."
+            )
+        return None
+
     async def _buy_reactor(self, ctx: commands.Context, emoji_raw: str) -> None:
         emoji_raw = emoji_raw.strip()
         if not emoji_raw:
-            await ctx.send(
-                "Usage: `$servershop buy reactor <paste an emoji here>`\n"
-                "Works with a regular emoji (🔥), or a custom/animated server "
-                "emoji — type `\\:emojiname:` in any message and send it to "
-                "reveal the raw `<a:name:id>` form, then paste that."
-            )
+            # No emoji given inline — offer a popup instead of a bare usage
+            # string. A modal can only ever be opened in direct response to
+            # an Interaction (a slash invocation, or a component click) —
+            # never from a plain text message, which has no interaction
+            # attached at all.
+            if ctx.interaction is not None:
+                # Invoked via slash: this IS the first response to that
+                # interaction, so we can pop the modal immediately.
+                await ctx.interaction.response.send_modal(ReactorEmojiModal(self))
+            else:
+                # Invoked via the classic "$" prefix: there's no interaction
+                # to attach a modal to, so offer a button instead — clicking
+                # it creates the interaction a modal needs.
+                await ctx.send(
+                    "Click below to enter your auto-reactor emoji.",
+                    view=ReactorBuyView(self),
+                )
             return
 
         parsed = await resolve_emoji(ctx.guild, emoji_raw)
@@ -491,32 +597,14 @@ class Shop(commands.Cog):
         gdata = self._guild_data(ctx.guild.id)
         record = self._get_purchase_record(gdata, ctx.author.id)
 
-        if storage_value in record["reactor_emojis"]:
-            await ctx.send("You already have that reactor emoji.")
+        precheck_error = self._reactor_precheck(record, storage_value)
+        if precheck_error:
+            await ctx.send(precheck_error)
             return
 
-        if len(record["reactor_emojis"]) >= MAX_REACTOR_EMOJIS:
-            await ctx.send(
-                f"You already have the max of {MAX_REACTOR_EMOJIS} reactor emojis. "
-                "Ask an admin to clear one first."
-            )
-            return
-
-        # Validate the emoji is actually usable by trying to react with it
-        # to the invoking message itself — cheap, immediate feedback if
-        # it's a custom emoji from a server the bot can't access, BEFORE
-        # any money changes hands.
-        try:
-            if parsed.is_custom_emoji():
-                await ctx.message.add_reaction(parsed)
-            else:
-                await ctx.message.add_reaction(parsed.name)
-        except discord.HTTPException:
-            kind = "animated custom" if parsed.animated else "custom" if parsed.is_custom_emoji() else "unicode"
-            await ctx.send(
-                f"I couldn't react with that {kind} emoji — it's likely from a "
-                "server I'm not in, or Discord rejected it. No charge was made."
-            )
+        test_error = await self._test_reactor_emoji(ctx.message, parsed)
+        if test_error:
+            await ctx.send(test_error)
             return
 
         if not await self._charge(ctx, AUTO_REACTOR_PRICE):
@@ -531,6 +619,64 @@ class Shop(commands.Cog):
             "whenever your name is mentioned in chat.",
         )
         await ctx.send(embed=embed)
+
+    async def handle_reactor_modal_submit(self, interaction: discord.Interaction, emoji_raw: str) -> None:
+        """Entry point for ReactorEmojiModal.on_submit below. A modal
+        submission only ever hands us an Interaction — never a
+        commands.Context — so this mirrors _buy_reactor's purchase logic
+        but speaks Interaction/webhook messaging instead of ctx.send, and
+        creates its own throwaway probe message to test-react against,
+        since there's no ctx.message here to reuse."""
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("This only works in a server.", ephemeral=True)
+            return
+
+        emoji_raw = emoji_raw.strip()
+        parsed = await resolve_emoji(guild, emoji_raw)
+        if parsed is None:
+            await interaction.response.send_message(
+                f"`{emoji_raw}` doesn't look like a valid emoji. Use a regular "
+                "emoji, or paste a custom emoji from this server.",
+                ephemeral=True,
+            )
+            return
+
+        storage_value = emoji_storage_value(parsed)
+        gdata = self._guild_data(guild.id)
+        record = self._get_purchase_record(gdata, interaction.user.id)
+
+        precheck_error = self._reactor_precheck(record, storage_value)
+        if precheck_error:
+            await interaction.response.send_message(precheck_error, ephemeral=True)
+            return
+
+        # The modal submission is itself an interaction we must respond to,
+        # so send a placeholder first — that gives us a real message to
+        # test-react against (ephemeral messages can't hold reactions),
+        # which we then edit in place with the final result either way.
+        await interaction.response.send_message("🔄 Validating emoji…")
+        probe_message = await interaction.original_response()
+
+        test_error = await self._test_reactor_emoji(probe_message, parsed)
+        if test_error:
+            await probe_message.edit(content=test_error)
+            return
+
+        charged, charge_error = self._try_charge(interaction.user.id, AUTO_REACTOR_PRICE)
+        if not charged:
+            await probe_message.edit(content=charge_error)
+            return
+
+        record["reactor_emojis"].append(storage_value)
+        self._save_guild_data(guild.id, gdata)
+
+        embed = _shop_embed(
+            "🔔 Auto-Reactor Purchased!",
+            f"{interaction.user.mention}, I'll now react with {emoji_display(parsed)} "
+            "whenever your name is mentioned in chat.",
+        )
+        await probe_message.edit(content=None, embed=embed)
 
     # ---------------------------------------------------------------
     # $autoreactor list / remove
