@@ -263,6 +263,32 @@ class Economy(commands.Cog):
         )
         return [(int(uid), acc.get("balance", 0)) for uid, acc in ranked[:limit]]
 
+        # ---------- BURN MONEY (OWNER) ----------
+
+    @commands.hybrid_command(description="[Owner only] Remove currency from a user's balance, for testing.")
+    @commands.is_owner()
+    async def burnmoney(self, ctx: commands.Context, amount: int = 0, member: discord.Member = None):
+        target = member or ctx.author
+        if amount <= 0:
+            return await ctx.send("Amount must be positive.", ephemeral=True)
+
+        new_bal = self.get_balance(target.id) - amount
+        self.set_balance(target.id, new_bal)
+
+        embed = _embed(
+            "🔒 Admin Burn",
+            config.EMBED_COLOR,
+            description=f"**-{amount:,} {CURRENCY}** ← {target.mention}",
+            fields=[("New Balance", f"**{self.get_balance(target.id):,} {CURRENCY}**\n{_petal_bar(self.get_balance(target.id))}", False)],
+        )
+        await ctx.send(embed=embed)
+
+    @burnmoney.error
+    async def burnmoney_error(self, ctx: commands.Context, error: commands.CommandError):
+        if isinstance(error, commands.NotOwner):
+            await ctx.send("This command is owner-only.", ephemeral=True)
+        else:
+            raise error
     # ---------- BALANCE ----------
 
     @commands.hybrid_command(aliases=["bal", "networth", "wallet"], description="Check your currency balance.")
