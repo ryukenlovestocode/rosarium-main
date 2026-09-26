@@ -654,6 +654,28 @@ class Shop(commands.Cog):
         content_lower = message.content.lower()
         mentioned_ids = {m.id for m in message.mentions}
 
+        # Replying to someone auto-adds them to message.mentions even if
+        # their name/@mention was never actually typed in the reply body —
+        # that's Discord's own "ping on reply" behavior, not something the
+        # sender chose. Exclude the replied-to author from the mention
+        # check so a plain reply never triggers someone else's reactor;
+        # an explicit @mention typed IN the reply body still counts fine,
+        # since that's a separate, deliberate mention.
+        reply_target_id: Optional[int] = None
+        if message.reference is not None:
+            resolved = message.reference.resolved
+            if isinstance(resolved, discord.Message):
+                reply_target_id = resolved.author.id
+            elif message.reference.message_id is not None:
+                # Not cached — fetch once so a reply-ping still can't leak
+                # through as a false match even when Discord didn't hand
+                # us the resolved message for free.
+                try:
+                    fetched = await message.channel.fetch_message(message.reference.message_id)
+                    reply_target_id = fetched.author.id
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    reply_target_id = None
+
         for user_id_str, record in purchases.items():
             emojis = record.get("reactor_emojis")
             if not emojis:
@@ -671,7 +693,7 @@ class Shop(commands.Cog):
                 member.display_name.lower() in content_lower
                 or member.name.lower() in content_lower
             )
-            mention_hit = user_id in mentioned_ids
+            mention_hit = user_id in mentioned_ids and user_id != reply_target_id
 
             if not (name_hit or mention_hit):
                 continue
