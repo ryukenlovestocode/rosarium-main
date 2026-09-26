@@ -77,6 +77,52 @@ MAX_REACTOR_EMOJIS = 3
 
 HEX_COLOR_RE = re.compile(r"^#?[0-9a-fA-F]{6}$")
 
+
+async def resolve_emoji(guild: discord.Guild, raw: str) -> Optional[discord.PartialEmoji]:
+    """Parse user input into a PartialEmoji: handles unicode emoji, the
+    full <a:name:id> / <:name:id> custom-emoji format, and a bare custom
+    emoji ID. Same parsing rules as reaction_roles.py's resolve_emoji —
+    duplicated locally (not imported) so this cog has no dependency on
+    reaction_roles.py being loaded."""
+    raw = raw.strip()
+
+    # Full custom emoji format: <:name:id> or <a:name:id>
+    if raw.startswith("<") and raw.endswith(">"):
+        try:
+            return discord.PartialEmoji.from_str(raw)
+        except Exception:
+            return None
+
+    # Bare custom emoji ID (numeric only)
+    if raw.isdigit():
+        emoji_obj = guild.get_emoji(int(raw))
+        if emoji_obj:
+            return discord.PartialEmoji(
+                name=emoji_obj.name, id=emoji_obj.id, animated=emoji_obj.animated
+            )
+        return None
+
+    # Otherwise treat as a plain unicode emoji
+    return discord.PartialEmoji(name=raw)
+
+
+def emoji_storage_value(emoji: discord.PartialEmoji) -> str:
+    """How a resolved emoji is stored in shop.json and re-sent to
+    message.add_reaction later. For custom emoji this MUST be the full
+    <a:name:id>/<:name:id> form — passing just the id or name as a plain
+    string to add_reaction does not work for custom emoji, only the
+    PartialEmoji object or this exact string form does."""
+    if emoji.is_custom_emoji():
+        return str(emoji)  # PartialEmoji.__str__ gives the <a:name:id> form
+    return emoji.name  # unicode emoji character
+
+
+def emoji_display(emoji: discord.PartialEmoji) -> str:
+    """Human-readable form for embeds — identical to emoji_storage_value
+    here since Discord renders the <a:name:id> form as the actual emoji
+    inline in any message/embed anyway."""
+    return emoji_storage_value(emoji)
+
 # ---------- CATALOG ----------
 # Prestige items are ordered cheapest-to-most-expensive on purpose — this
 # list order is what $servershop displays, and the ladder should read as
@@ -398,13 +444,28 @@ class Shop(commands.Cog):
     async def _buy_reactor(self, ctx: commands.Context, emoji_raw: str) -> None:
         emoji_raw = emoji_raw.strip()
         if not emoji_raw:
-            await ctx.send("Usage: `$servershop buy reactor <emoji>`")
+            await ctx.send(
+                "Usage: `$servershop buy reactor <paste an emoji here>`\n"
+                "Works with a regular emoji (🔥), or a custom/animated server "
+                "emoji — type `\\:emojiname:` in any message and send it to "
+                "reveal the raw `<a:name:id>` form, then paste that."
+            )
             return
+
+        parsed = await resolve_emoji(ctx.guild, emoji_raw)
+        if parsed is None:
+            await ctx.send(
+                f"`{emoji_raw}` doesn't look like a valid emoji. Use a regular "
+                "emoji, or paste a custom emoji from this server."
+            )
+            return
+
+        storage_value = emoji_storage_value(parsed)
 
         gdata = self._guild_data(ctx.guild.id)
         record = self._get_purchase_record(gdata, ctx.author.id)
 
-        if emoji_raw in record["reactor_emojis"]:
+        if storage_value in record["reactor_emojis"]:
             await ctx.send("You already have that reactor emoji.")
             return
 
@@ -417,28 +478,116 @@ class Shop(commands.Cog):
 
         # Validate the emoji is actually usable by trying to react with it
         # to the invoking message itself — cheap, immediate feedback if
-        # it's an emoji from a server the bot can't access.
+        # it's a custom emoji from a server the bot can't access, BEFORE
+        # any money changes hands.
         try:
-            await ctx.message.add_reaction(emoji_raw)
+            if parsed.is_custom_emoji():
+                await ctx.message.add_reaction(parsed)
+            else:
+                await ctx.message.add_reaction(parsed.name)
         except discord.HTTPException:
+            kind = "animated custom" if parsed.animated else "custom" if parsed.is_custom_emoji() else "unicode"
             await ctx.send(
-                f"`{emoji_raw}` doesn't look like a usable emoji — either it's not "
-                "valid, or it's a custom emoji from a server I'm not in."
+                f"I couldn't react with that {kind} emoji — it's likely from a "
+                "server I'm not in, or Discord rejected it. No charge was made."
             )
             return
 
         if not await self._charge(ctx, AUTO_REACTOR_PRICE):
             return
 
-        record["reactor_emojis"].append(emoji_raw)
+        record["reactor_emojis"].append(storage_value)
         self._save_guild_data(ctx.guild.id, gdata)
 
         embed = _shop_embed(
             "🔔 Auto-Reactor Purchased!",
-            f"{ctx.author.mention}, I'll now react with {emoji_raw} whenever your "
-            "name is mentioned in chat.",
+            f"{ctx.author.mention}, I'll now react with {emoji_display(parsed)} "
+            "whenever your name is mentioned in chat.",
         )
         await ctx.send(embed=embed)
+
+    # ---------------------------------------------------------------
+    # $autoreactor list / remove
+    # ---------------------------------------------------------------
+
+    @commands.hybrid_group(
+        name="autoreactor",
+        invoke_without_command=True,
+        description="Manage your purchased auto-reactor emojis.",
+    )
+    async def autoreactor(self, ctx: commands.Context) -> None:
+        # Bare $autoreactor with no subcommand just shows the list, since
+        # that's the info you need before removing one anyway.
+        await self.autoreactor_list.callback(self, ctx)
+
+    @autoreactor.command(name="list", description="Show your active auto-reactor emojis.")
+    async def autoreactor_list(self, ctx: commands.Context) -> None:
+        gdata = self._guild_data(ctx.guild.id)
+        record = self._get_purchase_record(gdata, ctx.author.id)
+        self._save_guild_data(ctx.guild.id, gdata)  # persist auto-created record
+
+        emojis = record["reactor_emojis"]
+        if not emojis:
+            await ctx.send(
+                "You don't have any auto-reactor emojis yet. "
+                "`$servershop buy reactor <emoji>` to get one."
+            )
+            return
+
+        lines = "\n".join(f"{i+1}. {e}" for i, e in enumerate(emojis))
+        embed = _shop_embed(
+            "🔔 Your Auto-Reactor Emojis",
+            f"{lines}\n\nRemove one with `$autoreactor remove <emoji>` "
+            "(paste it exactly as shown above).",
+        )
+        await ctx.send(embed=embed)
+
+    @autoreactor.command(
+        name="remove", description="Remove one of your auto-reactor emojis (no refund)."
+    )
+    async def autoreactor_remove(self, ctx: commands.Context, *, emoji_raw: str = "") -> None:
+        emoji_raw = emoji_raw.strip()
+        if not emoji_raw:
+            await ctx.send(
+                "Usage: `$autoreactor remove <emoji>` — run `$autoreactor list` "
+                "first to see the exact form to paste."
+            )
+            return
+
+        gdata = self._guild_data(ctx.guild.id)
+        record = self._get_purchase_record(gdata, ctx.author.id)
+
+        if not record["reactor_emojis"]:
+            await ctx.send("You don't have any auto-reactor emojis to remove.")
+            return
+
+        # Accept either the exact stored string, OR re-parse what they typed
+        # so pasting a custom emoji fresh still matches the stored <a:name:id>
+        # form even if Discord re-serializes it slightly differently.
+        target = None
+        if emoji_raw in record["reactor_emojis"]:
+            target = emoji_raw
+        else:
+            parsed = await resolve_emoji(ctx.guild, emoji_raw)
+            if parsed is not None:
+                candidate = emoji_storage_value(parsed)
+                if candidate in record["reactor_emojis"]:
+                    target = candidate
+
+        if target is None:
+            await ctx.send(
+                "That doesn't match any of your current auto-reactor emojis. "
+                "Run `$autoreactor list` to see them exactly as stored."
+            )
+            return
+
+        record["reactor_emojis"].remove(target)
+        self._save_guild_data(ctx.guild.id, gdata)
+
+        await ctx.send(
+            f"Removed {target} from your auto-reactors. No refund is given — "
+            "you can buy a new slot any time with `$servershop buy reactor <emoji>`."
+        )
 
     async def _buy_prestige(self, ctx: commands.Context, key: str) -> None:
         item = PRESTIGE_ITEMS[key]
