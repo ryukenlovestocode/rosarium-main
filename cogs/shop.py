@@ -53,6 +53,17 @@ Design notes:
     match on names; this can occasionally false-positive on short names
     (e.g. someone named "Max" reacts to "at max capacity") — this is a
     known, accepted trade-off of name-based matching, not a bug.
+  - Custom-emoji parsing (resolve_emoji) does its OWN regex match for the
+    <a:name:id> / <:name:id> shape rather than delegating to
+    discord.PartialEmoji.from_str(). from_str() does not raise on a
+    mismatch — it silently falls back to treating the *entire* "<...>"
+    string as a plain unicode emoji name (id=None, animated=False). That
+    previously caused valid animated/custom emoji to be misidentified as
+    "unicode" emoji whenever their shape didn't line up with from_str()'s
+    internal regex, producing a confusing "I couldn't react with that
+    unicode emoji" error for what was actually a perfectly valid animated
+    custom emoji. Parsing it ourselves means a real custom emoji is always
+    recognized as one, and only genuinely malformed input returns None.
 """
 
 from __future__ import annotations
@@ -77,6 +88,11 @@ MAX_REACTOR_EMOJIS = 3
 
 HEX_COLOR_RE = re.compile(r"^#?[0-9a-fA-F]{6}$")
 
+# Matches <:name:id> and <a:name:id>. Digit range is generous (Discord
+# snowflakes are currently ~17-19 digits but this won't break if that
+# creeps up over the bot's lifetime).
+CUSTOM_EMOJI_RE = re.compile(r"^<(?P<animated>a)?:(?P<name>[a-zA-Z0-9_]{2,32}):(?P<id>[0-9]{15,21})>$")
+
 
 async def resolve_emoji(guild: discord.Guild, raw: str) -> Optional[discord.PartialEmoji]:
     """Parse user input into a PartialEmoji: handles unicode emoji, the
@@ -88,10 +104,20 @@ async def resolve_emoji(guild: discord.Guild, raw: str) -> Optional[discord.Part
 
     # Full custom emoji format: <:name:id> or <a:name:id>
     if raw.startswith("<") and raw.endswith(">"):
-        try:
-            return discord.PartialEmoji.from_str(raw)
-        except Exception:
+        match = CUSTOM_EMOJI_RE.match(raw)
+        if match is None:
+            # Deliberately NOT delegating to discord.PartialEmoji.from_str()
+            # here — on a mismatch it doesn't raise, it silently treats the
+            # whole "<...>" string as a plain unicode emoji name, which is
+            # what produced the "unicode emoji" false-negative. Anything
+            # wrapped in angle brackets that isn't valid custom-emoji shape
+            # is just invalid.
             return None
+        return discord.PartialEmoji(
+            name=match["name"],
+            animated=bool(match["animated"]),
+            id=int(match["id"]),
+        )
 
     # Bare custom emoji ID (numeric only)
     if raw.isdigit():
