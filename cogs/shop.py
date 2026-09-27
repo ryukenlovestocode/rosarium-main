@@ -10,7 +10,10 @@ Items:
                                  choice, created once and kept forever.
   Auto-Reactor    (3,000,000)  — the bot reacts to a chosen emoji on any
                                  message that mentions you or contains
-                                 your name. Stacks up to 3 emojis.
+                                 your name. Price is per emoji; stacks up
+                                 to 3. Bought/removed via a popup form
+                                 (paste up to 3 at once, space/line
+                                 separated) rather than typing them inline.
   Prestige roles  (4M – 100M)  — a five-rung ladder of increasingly
                                  absurd, purely cosmetic status roles.
                                  One-time purchases, don't expire, and
@@ -19,10 +22,12 @@ Items:
 
 Commands:
   $servershop              — browse the catalog
-  $servershop buy <item>   — purchase an item (prompts for details where needed)
+  $servershop buy <item>   — purchase an item (reactor pops up a form)
   $servershop inventory    — see what you own
   $servershop setup        — [owner/staff] create the 5 prestige roles for
                               this server (one-time, run once per server)
+  $autoreactor list        — see your auto-reactor emojis
+  $autoreactor remove      — remove one or more (pops up a form too)
 
 Storage layout (cogs/data/shop.json):
 {
@@ -64,6 +69,16 @@ Design notes:
     unicode emoji" error for what was actually a perfectly valid animated
     custom emoji. Parsing it ourselves means a real custom emoji is always
     recognized as one, and only genuinely malformed input returns None.
+  - Auto-reactor buy/remove are entirely modal-driven now: `$servershop buy
+    reactor` and `$autoreactor remove` with no inline emoji pop up a form
+    (a button first for classic "$" invocations, since a modal can only
+    ever be opened in direct response to an Interaction). Both forms take
+    up to MAX_REACTOR_EMOJIS at once via a paragraph-style field, processed
+    by _process_reactor_batch / _process_reactor_removal — one emoji at a
+    time, in order, so a partial success (e.g. funds run out on the 2nd of
+    3) still keeps whatever went through instead of an all-or-nothing
+    transaction. The old inline-argument form (`buy reactor <emoji>`) still
+    works too, unchanged, for anyone scripting it or who prefers typing.
 """
 
 from __future__ import annotations
@@ -212,15 +227,18 @@ def _shop_embed(title: str, description: str = "", color: Optional[int] = None) 
 
 
 class ReactorEmojiModal(discord.ui.Modal, title="Auto-Reactor Emoji"):
-    """The popup form for buying the auto-reactor without typing the emoji
-    inline. Submitting it hands control straight to
+    """The popup form for buying the auto-reactor without typing the
+    emoji(s) inline. Accepts up to MAX_REACTOR_EMOJIS at once, separated by
+    spaces or new lines — a paragraph-style field so pasting several on
+    separate lines works too. Submitting it hands control straight to
     Shop.handle_reactor_modal_submit, which does the actual validate/charge/
     save work — this class is just the UI shell."""
 
     emoji_input: discord.ui.TextInput = discord.ui.TextInput(
-        label="Emoji",
-        placeholder="🔥  or a custom/animated emoji from any server I'm in",
-        max_length=100,
+        label="Emoji(s) — up to 3, space-separated",
+        style=discord.TextStyle.paragraph,
+        placeholder="🔥  or  <a:name:id> <a:name:id> <a:name:id>",
+        max_length=300,
         required=True,
     )
 
@@ -249,6 +267,43 @@ class ReactorBuyView(discord.ui.View):
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
         await interaction.response.send_modal(ReactorEmojiModal(self.cog))
+
+
+class ReactorRemoveModal(discord.ui.Modal, title="Remove Auto-Reactor Emoji"):
+    """Popup form for removing one or more auto-reactor emojis without
+    needing the exact `$autoreactor remove <emoji>` syntax. Accepts
+    multiple emojis at once, same as ReactorEmojiModal above. Submitting it
+    hands off to Shop.handle_reactor_remove_modal_submit."""
+
+    emoji_input: discord.ui.TextInput = discord.ui.TextInput(
+        label="Emoji(s) to remove",
+        style=discord.TextStyle.paragraph,
+        placeholder="Paste one or more of your current auto-reactor emojis",
+        max_length=300,
+        required=True,
+    )
+
+    def __init__(self, cog: "Shop") -> None:
+        super().__init__()
+        self.cog = cog
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await self.cog.handle_reactor_remove_modal_submit(interaction, self.emoji_input.value)
+
+
+class ReactorRemoveView(discord.ui.View):
+    """Shown only when `$autoreactor remove` is invoked via the classic "$"
+    prefix with no emoji given — same rationale as ReactorBuyView above."""
+
+    def __init__(self, cog: "Shop") -> None:
+        super().__init__(timeout=180)
+        self.cog = cog
+
+    @discord.ui.button(label="Remove Emoji", style=discord.ButtonStyle.danger, emoji="🗑️")
+    async def remove_emoji(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await interaction.response.send_modal(ReactorRemoveModal(self.cog))
 
 
 class Shop(commands.Cog):
@@ -347,9 +402,10 @@ class Shop(commands.Cog):
             f"🎨 **Custom Role** — {_fmt(CUSTOM_ROLE_PRICE)}",
             "   `$servershop buy customrole <name> <#hexcolor>`",
             "",
-            f"🔔 **Auto-Reactor** — {_fmt(AUTO_REACTOR_PRICE)}",
-            f"   Reacts to your name in chat. Max {MAX_REACTOR_EMOJIS} at once.",
-            "   `$servershop buy reactor <emoji>`",
+            f"🔔 **Auto-Reactor** — {_fmt(AUTO_REACTOR_PRICE)} each, up to {MAX_REACTOR_EMOJIS}",
+            "   Reacts to your name in chat.",
+            "   `$servershop buy reactor` — opens a form (paste up to "
+            f"{MAX_REACTOR_EMOJIS} at once)",
             "",
             "🏆 **Prestige** — one-time, permanent status roles",
         ]
@@ -452,7 +508,7 @@ class Shop(commands.Cog):
 
     @servershop.command(
         name="buy",
-        description="Buy an item: customrole <name> <#color> | reactor <emoji> | a prestige key",
+        description="Buy an item: customrole <name> <#color> | reactor (opens a form) | a prestige key",
     )
     async def buy(self, ctx: commands.Context, item: str, *, args: str = "") -> None:
         item = item.lower()
@@ -525,19 +581,88 @@ class Shop(commands.Cog):
         )
         await ctx.send(embed=embed)
 
+    async def _process_reactor_batch(
+        self,
+        *,
+        guild: discord.Guild,
+        user_id: int,
+        tokens: list[str],
+        test_message: discord.Message,
+    ) -> tuple[list[str], list[str]]:
+        """Process a batch of raw emoji tokens for an auto-reactor purchase,
+        in order: parse, dedupe (within the batch and against what's already
+        owned), enforce the MAX_REACTOR_EMOJIS cap, test-react, then charge —
+        one emoji at a time, since each is billed separately. Saves guild
+        data after every successful item, so a failure partway through a
+        multi-emoji batch never loses the ones that already went through.
+        Returns (purchased_display, problem_lines); problem_lines explains
+        anything skipped or failed, in the order it was hit. Shared by the
+        classic ctx-based path (_buy_reactor) and the modal-based one
+        (handle_reactor_modal_submit) — only how each sends the result
+        differs."""
+        gdata = self._guild_data(guild.id)
+        record = self._get_purchase_record(gdata, user_id)
+
+        purchased: list[str] = []
+        problems: list[str] = []
+        seen_this_batch: set[str] = set()
+
+        for raw in tokens:
+            if len(record["reactor_emojis"]) >= MAX_REACTOR_EMOJIS:
+                problems.append(f"`{raw}` — skipped, you're already at the max of {MAX_REACTOR_EMOJIS}.")
+                continue
+
+            parsed = await resolve_emoji(guild, raw)
+            if parsed is None:
+                problems.append(f"`{raw}` — doesn't look like a valid emoji.")
+                continue
+
+            storage_value = emoji_storage_value(parsed)
+
+            if storage_value in seen_this_batch:
+                problems.append(f"{emoji_display(parsed)} — listed twice, only counted once.")
+                continue
+            seen_this_batch.add(storage_value)
+
+            if storage_value in record["reactor_emojis"]:
+                problems.append(f"{emoji_display(parsed)} — you already have this one.")
+                continue
+
+            test_error = await self._test_reactor_emoji(test_message, parsed)
+            if test_error:
+                problems.append(f"{emoji_display(parsed)} — {test_error}")
+                continue
+
+            charged, charge_error = self._try_charge(user_id, AUTO_REACTOR_PRICE)
+            if not charged:
+                problems.append(f"{emoji_display(parsed)} — {charge_error}")
+                # Balance won't recover mid-batch — no point trying the rest.
+                break
+
+            record["reactor_emojis"].append(storage_value)
+            purchased.append(emoji_display(parsed))
+            self._save_guild_data(guild.id, gdata)
+
+        return purchased, problems
+
     @staticmethod
-    def _reactor_precheck(record: dict, storage_value: str) -> Optional[str]:
-        """Shared 'already own it / hit the cap' check for the reactor
-        purchase flow, used by both the classic ctx-based path and the
-        modal/interaction-based one below."""
-        if storage_value in record["reactor_emojis"]:
-            return "You already have that reactor emoji."
-        if len(record["reactor_emojis"]) >= MAX_REACTOR_EMOJIS:
-            return (
-                f"You already have the max of {MAX_REACTOR_EMOJIS} reactor emojis. "
-                "Ask an admin to clear one first."
+    def _reactor_purchase_embed(mention: str, purchased: list[str], problems: list[str]) -> discord.Embed:
+        """Result embed shared by both reactor-purchase entry points, after
+        a (possibly multi-emoji) batch has been processed."""
+        lines = []
+        if purchased:
+            lines.append(
+                f"{mention}, I'll now react with {' '.join(purchased)} "
+                "whenever your name is mentioned in chat."
             )
-        return None
+        if problems:
+            if purchased:
+                lines.append("")
+            lines.append("**Skipped:**")
+            lines.extend(f"• {p}" for p in problems)
+
+        title = "🔔 Auto-Reactor Purchased!" if purchased else "🔔 Auto-Reactor"
+        return _shop_embed(title, "\n".join(lines) if lines else "Nothing purchased.")
 
     @staticmethod
     async def _test_reactor_emoji(message: discord.Message, parsed: discord.PartialEmoji) -> Optional[str]:
@@ -579,46 +704,21 @@ class Shop(commands.Cog):
                 # to attach a modal to, so offer a button instead — clicking
                 # it creates the interaction a modal needs.
                 await ctx.send(
-                    "Click below to enter your auto-reactor emoji.",
+                    "Click below to enter your auto-reactor emoji(s).",
                     view=ReactorBuyView(self),
                 )
             return
 
-        parsed = await resolve_emoji(ctx.guild, emoji_raw)
-        if parsed is None:
-            await ctx.send(
-                f"`{emoji_raw}` doesn't look like a valid emoji. Use a regular "
-                "emoji, or paste a custom emoji from this server."
-            )
-            return
-
-        storage_value = emoji_storage_value(parsed)
-
-        gdata = self._guild_data(ctx.guild.id)
-        record = self._get_purchase_record(gdata, ctx.author.id)
-
-        precheck_error = self._reactor_precheck(record, storage_value)
-        if precheck_error:
-            await ctx.send(precheck_error)
-            return
-
-        test_error = await self._test_reactor_emoji(ctx.message, parsed)
-        if test_error:
-            await ctx.send(test_error)
-            return
-
-        if not await self._charge(ctx, AUTO_REACTOR_PRICE):
-            return
-
-        record["reactor_emojis"].append(storage_value)
-        self._save_guild_data(ctx.guild.id, gdata)
-
-        embed = _shop_embed(
-            "🔔 Auto-Reactor Purchased!",
-            f"{ctx.author.mention}, I'll now react with {emoji_display(parsed)} "
-            "whenever your name is mentioned in chat.",
+        # Up to MAX_REACTOR_EMOJIS may be given in one go, space-separated —
+        # e.g. `$servershop buy reactor <a:b:1> <a:h:2> <a:k:3>`.
+        tokens = emoji_raw.split()
+        purchased, problems = await self._process_reactor_batch(
+            guild=ctx.guild,
+            user_id=ctx.author.id,
+            tokens=tokens,
+            test_message=ctx.message,
         )
-        await ctx.send(embed=embed)
+        await ctx.send(embed=self._reactor_purchase_embed(ctx.author.mention, purchased, problems))
 
     async def handle_reactor_modal_submit(self, interaction: discord.Interaction, emoji_raw: str) -> None:
         """Entry point for ReactorEmojiModal.on_submit below. A modal
@@ -626,29 +726,17 @@ class Shop(commands.Cog):
         commands.Context — so this mirrors _buy_reactor's purchase logic
         but speaks Interaction/webhook messaging instead of ctx.send, and
         creates its own throwaway probe message to test-react against,
-        since there's no ctx.message here to reuse."""
+        since there's no ctx.message here to reuse. The modal's field is
+        paragraph-style, so up to MAX_REACTOR_EMOJIS may be pasted at once,
+        space- or newline-separated."""
         guild = interaction.guild
         if guild is None:
             await interaction.response.send_message("This only works in a server.", ephemeral=True)
             return
 
-        emoji_raw = emoji_raw.strip()
-        parsed = await resolve_emoji(guild, emoji_raw)
-        if parsed is None:
-            await interaction.response.send_message(
-                f"`{emoji_raw}` doesn't look like a valid emoji. Use a regular "
-                "emoji, or paste a custom emoji from this server.",
-                ephemeral=True,
-            )
-            return
-
-        storage_value = emoji_storage_value(parsed)
-        gdata = self._guild_data(guild.id)
-        record = self._get_purchase_record(gdata, interaction.user.id)
-
-        precheck_error = self._reactor_precheck(record, storage_value)
-        if precheck_error:
-            await interaction.response.send_message(precheck_error, ephemeral=True)
+        tokens = emoji_raw.split()
+        if not tokens:
+            await interaction.response.send_message("Enter at least one emoji.", ephemeral=True)
             return
 
         # The modal submission is itself an interaction we must respond to,
@@ -658,24 +746,13 @@ class Shop(commands.Cog):
         await interaction.response.send_message("🔄 Validating emoji…")
         probe_message = await interaction.original_response()
 
-        test_error = await self._test_reactor_emoji(probe_message, parsed)
-        if test_error:
-            await probe_message.edit(content=test_error)
-            return
-
-        charged, charge_error = self._try_charge(interaction.user.id, AUTO_REACTOR_PRICE)
-        if not charged:
-            await probe_message.edit(content=charge_error)
-            return
-
-        record["reactor_emojis"].append(storage_value)
-        self._save_guild_data(guild.id, gdata)
-
-        embed = _shop_embed(
-            "🔔 Auto-Reactor Purchased!",
-            f"{interaction.user.mention}, I'll now react with {emoji_display(parsed)} "
-            "whenever your name is mentioned in chat.",
+        purchased, problems = await self._process_reactor_batch(
+            guild=guild,
+            user_id=interaction.user.id,
+            tokens=tokens,
+            test_message=probe_message,
         )
+        embed = self._reactor_purchase_embed(interaction.user.mention, purchased, problems)
         await probe_message.edit(content=None, embed=embed)
 
     # ---------------------------------------------------------------
@@ -702,64 +779,127 @@ class Shop(commands.Cog):
         if not emojis:
             await ctx.send(
                 "You don't have any auto-reactor emojis yet. "
-                "`$servershop buy reactor <emoji>` to get one."
+                "`$servershop buy reactor` to get one — it opens a form."
             )
             return
 
         lines = "\n".join(f"{i+1}. {e}" for i, e in enumerate(emojis))
         embed = _shop_embed(
             "🔔 Your Auto-Reactor Emojis",
-            f"{lines}\n\nRemove one with `$autoreactor remove <emoji>` "
-            "(paste it exactly as shown above).",
+            f"{lines}\n\nRemove one with `$autoreactor remove` — pops up a form "
+            "too — or `$autoreactor remove <emoji>` to skip straight to it.",
         )
         await ctx.send(embed=embed)
 
     @autoreactor.command(
-        name="remove", description="Remove one of your auto-reactor emojis (no refund)."
+        name="remove", description="Remove one or more of your auto-reactor emojis (no refund)."
     )
     async def autoreactor_remove(self, ctx: commands.Context, *, emoji_raw: str = "") -> None:
-        emoji_raw = emoji_raw.strip()
-        if not emoji_raw:
-            await ctx.send(
-                "Usage: `$autoreactor remove <emoji>` — run `$autoreactor list` "
-                "first to see the exact form to paste."
-            )
-            return
-
         gdata = self._guild_data(ctx.guild.id)
         record = self._get_purchase_record(gdata, ctx.author.id)
+        self._save_guild_data(ctx.guild.id, gdata)  # persist auto-created record
 
         if not record["reactor_emojis"]:
             await ctx.send("You don't have any auto-reactor emojis to remove.")
             return
 
-        # Accept either the exact stored string, OR re-parse what they typed
-        # so pasting a custom emoji fresh still matches the stored <a:name:id>
-        # form even if Discord re-serializes it slightly differently.
-        target = None
-        if emoji_raw in record["reactor_emojis"]:
-            target = emoji_raw
-        else:
-            parsed = await resolve_emoji(ctx.guild, emoji_raw)
-            if parsed is not None:
-                candidate = emoji_storage_value(parsed)
-                if candidate in record["reactor_emojis"]:
-                    target = candidate
-
-        if target is None:
-            await ctx.send(
-                "That doesn't match any of your current auto-reactor emojis. "
-                "Run `$autoreactor list` to see them exactly as stored."
-            )
+        emoji_raw = emoji_raw.strip()
+        if not emoji_raw:
+            # No emoji given inline — same modal/button bridge as buying: a
+            # modal only ever opens in direct response to an Interaction,
+            # which a plain text message doesn't have.
+            if ctx.interaction is not None:
+                await ctx.interaction.response.send_modal(ReactorRemoveModal(self))
+            else:
+                await ctx.send(
+                    "Click below to remove an auto-reactor emoji.",
+                    view=ReactorRemoveView(self),
+                )
             return
 
-        record["reactor_emojis"].remove(target)
-        self._save_guild_data(ctx.guild.id, gdata)
+        tokens = emoji_raw.split()
+        removed, problems = await self._process_reactor_removal(ctx.guild, ctx.author.id, tokens)
+        await ctx.send(embed=self._reactor_removal_embed(removed, problems))
 
-        await ctx.send(
-            f"Removed {target} from your auto-reactors. No refund is given — "
-            "you can buy a new slot any time with `$servershop buy reactor <emoji>`."
-        )
+    async def _process_reactor_removal(
+        self, guild: discord.Guild, user_id: int, tokens: list[str]
+    ) -> tuple[list[str], list[str]]:
+        """Remove each token in `tokens` from the user's stored
+        reactor_emojis. Matches either the exact stored string or a freshly
+        re-parsed form of what was pasted, so a custom emoji re-copied from
+        the picker still matches the stored <a:name:id> form even if
+        Discord re-serializes it slightly differently. No refund is given,
+        matching the original single-emoji behavior. Returns
+        (removed_display, problem_lines) and saves guild data immediately
+        if anything was removed. Shared by the classic ctx-based path
+        (autoreactor_remove) and the modal-based one
+        (handle_reactor_remove_modal_submit)."""
+        gdata = self._guild_data(guild.id)
+        record = self._get_purchase_record(gdata, user_id)
+
+        removed: list[str] = []
+        problems: list[str] = []
+
+        for raw in tokens:
+            target = None
+            if raw in record["reactor_emojis"]:
+                target = raw
+            else:
+                parsed = await resolve_emoji(guild, raw)
+                if parsed is not None:
+                    candidate = emoji_storage_value(parsed)
+                    if candidate in record["reactor_emojis"]:
+                        target = candidate
+
+            if target is None:
+                problems.append(f"`{raw}` — doesn't match any of your current auto-reactor emojis.")
+                continue
+
+            record["reactor_emojis"].remove(target)
+            removed.append(target)
+
+        if removed:
+            self._save_guild_data(guild.id, gdata)
+
+        return removed, problems
+
+    @staticmethod
+    def _reactor_removal_embed(removed: list[str], problems: list[str]) -> discord.Embed:
+        """Result embed shared by both removal entry points."""
+        lines = []
+        if removed:
+            lines.append(f"Removed: {' '.join(removed)}")
+        if problems:
+            if removed:
+                lines.append("")
+            lines.append("**Not found:**")
+            lines.extend(f"• {p}" for p in problems)
+        if removed:
+            lines.append(
+                "\nNo refund is given — you can buy a new slot any time with "
+                "`$servershop buy reactor`."
+            )
+
+        title = "🗑️ Auto-Reactor Emoji Removed" if removed else "Auto-Reactor"
+        return _shop_embed(title, "\n".join(lines) if lines else "Nothing removed.")
+
+    async def handle_reactor_remove_modal_submit(self, interaction: discord.Interaction, emoji_raw: str) -> None:
+        """Entry point for ReactorRemoveModal.on_submit. Mirrors
+        autoreactor_remove's logic but speaks Interaction messaging instead
+        of ctx.send, since a modal submission only ever hands us an
+        Interaction, never a commands.Context."""
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("This only works in a server.", ephemeral=True)
+            return
+
+        tokens = emoji_raw.split()
+        if not tokens:
+            await interaction.response.send_message("Enter at least one emoji to remove.", ephemeral=True)
+            return
+
+        removed, problems = await self._process_reactor_removal(guild, interaction.user.id, tokens)
+        await interaction.response.send_message(embed=self._reactor_removal_embed(removed, problems))
 
     async def _buy_prestige(self, ctx: commands.Context, key: str) -> None:
         item = PRESTIGE_ITEMS[key]
