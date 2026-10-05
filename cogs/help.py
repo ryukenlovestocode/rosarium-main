@@ -83,7 +83,7 @@ def build_pages(bot: commands.Bot) -> list[Page]:
                 "🌿  Sections",
                 f"🕊️ **General** {DIV} ping, about, this menu\n"
                 f"🕯️ **Utility** {DIV} actions, afk, avatars, quote cards\n"
-                f"💞 **Fun** {DIV} marriage, ship, anonymous confessions\n"
+                f"💞 **Fun** {DIV} marriage, ship, confessions, counting\n"
                 f"🌹 **Economy** {DIV} petals, daily, pay, leaderboard\n"
                 f"🎲 **Casino** {DIV} coinflip, dice, wheel, fish, slots, blackjack, rob\n"
                 f"⛓️ **Moderation** {DIV} staff tools, warnings, roles\n"
@@ -190,6 +190,13 @@ def build_pages(bot: commands.Bot) -> list[Page]:
                 f"┣ The public post never shows who sent it\n"
                 f"┣ You get a quiet DM confirming it went through\n"
                 f"┗ *30s cooldown · use the prefix form so the message can be deleted*",
+            ),
+            (
+                "🔢  Counting · Manage Channels to start",
+                f"`{p}countstart` {DIV} start the counting game in this channel\n"
+                f"┣ Count up from **1**, one number per message — math like `4+3` counts as 7\n"
+                f"┣ A wrong number, or counting twice in a row, sends it back to **1**\n"
+                f"┗ *Anyone can play once it's running. State is in-memory — a restart stops it.*",
             ),
         ],
     )
@@ -352,9 +359,10 @@ def build_pages(bot: commands.Bot) -> list[Page]:
             ),
             (
                 "🌱  Autorole · Manage Roles",
-                "`/autorole set <@role>` " + DIV + " give this role to every new member\n"
-                "`/autorole disable` " + DIV + " turn autorole off\n"
-                "`/autorole status` " + DIV + " show the current role and log channel\n"
+                "`/autorole add <@role>` " + DIV + " give this role to every new member (up to 10 roles)\n"
+                "`/autorole remove <@role>` " + DIV + " stop giving one of those roles\n"
+                "`/autorole disable` " + DIV + " turn autorole off and clear the list\n"
+                "`/autorole status` " + DIV + " show the current roles and log channel\n"
                 "`/autorole log set <#channel>` " + DIV + " post a note there each time a role is assigned\n"
                 "`/autorole log disable` " + DIV + " stop those notes\n"
                 "┗ *Bots are skipped. Failed assignments (deleted role, missing permissions) are reported to the log channel too.*",

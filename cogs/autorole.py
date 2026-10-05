@@ -1,24 +1,29 @@
 """
 AutoRole cog for Roselle (Rosarium).
 
-Assigns one configured role to every member automatically when they join,
-and optionally posts a notification to a configured channel each time it
-does (or fails to).
+Assigns the configured roles (up to MAX_ROLES) to every member
+automatically when they join, and optionally posts a notification to a
+configured channel each time it does (or fails to).
 
 Commands:
-- /autorole set              -> set (or change) the role given to new members
-- /autorole disable          -> turn autorole off for this server
+- /autorole add <role>       -> add a role to the list new members get
+- /autorole remove <role>    -> take a role off that list
+- /autorole disable          -> turn autorole off for this server (clears the list)
 - /autorole status           -> show the current settings
 - /autorole log set          -> set the channel autorole notifications go to
 - /autorole log disable      -> stop posting autorole notifications
 
 Storage layout:
 
-cogs/data/autorole.json  (unchanged, so existing data keeps working)
+cogs/data/autorole.json  (same file as before, so existing data keeps working)
 {
-  "<guild_id>": <role_id>,
+  "<guild_id>": [<role_id>, <role_id>, ...],
   ...
 }
+
+Older versions stored a single role id (`"<guild_id>": <role_id>`). That
+form is still read correctly, and is rewritten as a list the next time the
+guild's autoroles change.
 
 cogs/data/autorole_log.json
 {
@@ -27,6 +32,13 @@ cogs/data/autorole_log.json
 }
 
 A guild simply has no key (or a null value) when the setting is disabled.
+
+Joining behaviour: all usable roles are given in a single request. A role
+that no longer exists is dropped from the list; a role the bot can't assign
+(managed, or at/above the bot's top role) is skipped but stays configured.
+Either way the remaining roles are still given, and the log channel (if
+set) says what was skipped. This matters because Discord rejects the whole
+request if even one role in it is out of the bot's reach.
 """
 
 from __future__ import annotations
@@ -49,6 +61,9 @@ LOG_DATA_PATH = os.path.join(os.path.dirname(__file__), "data", "autorole_log.js
 SUCCESS_COLOR = 0xFFC0DC
 FAIL_COLOR = 0xE05A5A
 
+# Most roles a server can have on the autorole list.
+MAX_ROLES = 10
+
 
 class AutoRole(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
@@ -56,17 +71,54 @@ class AutoRole(commands.Cog):
         self.store = JSONStore(DATA_PATH, default={})
         self.log_store = JSONStore(LOG_DATA_PATH, default={})
 
-    def _get_role_id(self, guild_id: int) -> Optional[int]:
-        return self.store.get(str(guild_id), None)
+    # ---------- STORAGE ----------
 
-    def _set_role_id(self, guild_id: int, role_id: Optional[int]) -> None:
-        self.store.set(str(guild_id), role_id)
+    def _get_role_ids(self, guild_id: int) -> list[int]:
+        """The configured autorole ids, in the order they were added."""
+        raw = self.store.get(str(guild_id), None)
+        if raw is None:
+            return []
+        if isinstance(raw, int):  # legacy format: a single role id
+            return [raw]
+        if isinstance(raw, list):
+            return list(dict.fromkeys(r for r in raw if isinstance(r, int)))
+        return []
+
+    def _set_role_ids(self, guild_id: int, role_ids: list[int]) -> None:
+        self.store.set(str(guild_id), list(role_ids) if role_ids else None)
 
     def _get_log_channel_id(self, guild_id: int) -> Optional[int]:
         return self.log_store.get(str(guild_id), None)
 
     def _set_log_channel_id(self, guild_id: int, channel_id: Optional[int]) -> None:
         self.log_store.set(str(guild_id), channel_id)
+
+    # ---------- HELPERS ----------
+
+    @staticmethod
+    def _assign_problem(role: discord.Role, me: discord.Member) -> Optional[str]:
+        """Why the bot can't hand out this role, or None if it can."""
+        if role.is_default():
+            return "Can't use @everyone as an autorole."
+        if role.managed:
+            return (
+                f"{role.mention} is managed by an integration (e.g. a bot or booster "
+                "role) and can't be assigned manually."
+            )
+        if role >= me.top_role:
+            return (
+                f"I can't assign {role.mention} — it's the same as or higher than my "
+                "own top role. Move my role above it in Server Settings > Roles."
+            )
+        return None
+
+    @staticmethod
+    def _format_roles(guild: discord.Guild, role_ids: list[int]) -> str:
+        parts = []
+        for role_id in role_ids:
+            role = guild.get_role(role_id)
+            parts.append(role.mention if role else f"`deleted-role:{role_id}`")
+        return ", ".join(parts)
 
     async def _notify(self, guild: discord.Guild, embed: discord.Embed) -> None:
         """Post an embed to the configured log channel, if there is one. Never raises."""
@@ -96,9 +148,11 @@ class AutoRole(commands.Cog):
                 "Failed to post autorole notification in guild %s: %s", guild.id, e
             )
 
+    # ---------- COMMANDS ----------
+
     autorole_group = app_commands.Group(
         name="autorole",
-        description="Automatically assign a role to new members",
+        description="Automatically assign roles to new members",
         default_permissions=discord.Permissions(manage_roles=True),
     )
 
@@ -108,65 +162,94 @@ class AutoRole(commands.Cog):
         parent=autorole_group,
     )
 
-    @autorole_group.command(name="set", description="Set the role new members get automatically")
-    @app_commands.describe(role="The role to assign on join")
-    async def set(self, interaction: discord.Interaction, role: discord.Role) -> None:
+    @autorole_group.command(name="add", description="Add a role that new members get automatically")
+    @app_commands.describe(role="The role to give new members when they join")
+    async def add(self, interaction: discord.Interaction, role: discord.Role) -> None:
         guild = interaction.guild
         assert guild is not None
 
-        if role.is_default():
+        role_ids = self._get_role_ids(guild.id)
+
+        if role.id in role_ids:
             await interaction.response.send_message(
-                "Can't use @everyone as the autorole.", ephemeral=True
+                f"{role.mention} is already given to new members.", ephemeral=True
             )
             return
 
-        if role.managed:
+        problem = self._assign_problem(role, guild.me)
+        if problem is not None:
+            await interaction.response.send_message(problem, ephemeral=True)
+            return
+
+        if len(role_ids) >= MAX_ROLES:
             await interaction.response.send_message(
-                f"{role.mention} is managed by an integration (e.g. a bot or booster "
-                "role) and can't be assigned manually.",
+                f"You can have at most **{MAX_ROLES}** autoroles. "
+                "Remove one with `/autorole remove` first.",
                 ephemeral=True,
             )
             return
 
-        if role >= guild.me.top_role:
-            await interaction.response.send_message(
-                f"I can't assign {role.mention} — it's the same as or higher than my "
-                "own top role. Move my role above it in Server Settings > Roles.",
-                ephemeral=True,
-            )
-            return
-
-        self._set_role_id(guild.id, role.id)
+        role_ids.append(role.id)
+        self._set_role_ids(guild.id, role_ids)
         await interaction.response.send_message(
-            f"New members will now automatically get {role.mention}.", ephemeral=True
+            f"Added {role.mention}. New members will now automatically get: "
+            f"{self._format_roles(guild, role_ids)}.",
+            ephemeral=True,
         )
 
-    @autorole_group.command(name="disable", description="Stop automatically assigning a role to new members")
+    @autorole_group.command(name="remove", description="Stop giving a role to new members")
+    @app_commands.describe(role="The role to take off the autorole list")
+    async def remove(self, interaction: discord.Interaction, role: discord.Role) -> None:
+        guild = interaction.guild
+        assert guild is not None
+
+        role_ids = self._get_role_ids(guild.id)
+
+        if role.id not in role_ids:
+            await interaction.response.send_message(
+                f"{role.mention} isn't one of the autoroles.", ephemeral=True
+            )
+            return
+
+        role_ids.remove(role.id)
+        self._set_role_ids(guild.id, role_ids)
+
+        if role_ids:
+            message = (
+                f"Removed {role.mention}. New members still get: "
+                f"{self._format_roles(guild, role_ids)}."
+            )
+        else:
+            message = f"Removed {role.mention}. No autoroles are left, so autorole is now disabled."
+        await interaction.response.send_message(message, ephemeral=True)
+
+    @autorole_group.command(name="disable", description="Stop automatically assigning roles to new members")
     async def disable(self, interaction: discord.Interaction) -> None:
         guild = interaction.guild
         assert guild is not None
 
-        if self._get_role_id(guild.id) is None:
+        role_ids = self._get_role_ids(guild.id)
+        if not role_ids:
             await interaction.response.send_message(
                 "Autorole is already disabled for this server.", ephemeral=True
             )
             return
 
-        self._set_role_id(guild.id, None)
-        await interaction.response.send_message("Autorole disabled.", ephemeral=True)
+        self._set_role_ids(guild.id, [])
+        await interaction.response.send_message(
+            f"Autorole disabled ({len(role_ids)} role(s) cleared).", ephemeral=True
+        )
 
     @autorole_group.command(name="status", description="Show the current autorole settings")
     async def status(self, interaction: discord.Interaction) -> None:
         guild = interaction.guild
         assert guild is not None
 
-        role_id = self._get_role_id(guild.id)
-        if role_id is None:
+        role_ids = self._get_role_ids(guild.id)
+        if not role_ids:
             role_line = "Autorole is currently disabled."
         else:
-            role = guild.get_role(role_id)
-            role_txt = role.mention if role else f"`deleted-role:{role_id}`"
-            role_line = f"New members currently get {role_txt}."
+            role_line = f"New members currently get: {self._format_roles(guild, role_ids)}."
 
         channel_id = self._get_log_channel_id(guild.id)
         if channel_id is None:
@@ -181,7 +264,7 @@ class AutoRole(commands.Cog):
         )
 
     @log_group.command(name="set", description="Set the channel autorole notifications are posted in")
-    @app_commands.describe(channel="Where to post a message each time a role is auto-assigned")
+    @app_commands.describe(channel="Where to post a message each time roles are auto-assigned")
     async def log_set(
         self, interaction: discord.Interaction, channel: discord.TextChannel
     ) -> None:
@@ -220,6 +303,8 @@ class AutoRole(commands.Cog):
             "Autorole notifications disabled.", ephemeral=True
         )
 
+    # ---------- ON JOIN ----------
+
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member) -> None:
         if member.bot:
@@ -228,76 +313,119 @@ class AutoRole(commands.Cog):
             # granting a member role to them is rarely intended.
             return
 
-        role_id = self._get_role_id(member.guild.id)
-        if role_id is None:
+        guild = member.guild
+        configured = self._get_role_ids(guild.id)
+        if not configured:
             return
 
-        role = member.guild.get_role(role_id)
-        if role is None:
+        # Sort the configured roles into: usable, deleted, and out of reach.
+        # Discord rejects the whole request if any single role in it can't be
+        # assigned, so unusable roles must be left out rather than sent along.
+        roles: list[discord.Role] = []
+        missing_ids: list[int] = []
+        blocked: list[discord.Role] = []
+        for role_id in configured:
+            role = guild.get_role(role_id)
+            if role is None:
+                missing_ids.append(role_id)
+            elif self._assign_problem(role, guild.me) is not None:
+                blocked.append(role)
+            else:
+                roles.append(role)
+
+        if missing_ids:
+            # Deleted roles can't be picked in /autorole remove, so drop them
+            # here. (No awaits since the read above, so nothing can interleave.)
+            self._set_role_ids(
+                guild.id, [rid for rid in configured if rid not in missing_ids]
+            )
             logger.warning(
-                "Autorole for guild %s points at a deleted role (%s); skipping.",
-                member.guild.id,
-                role_id,
+                "Autorole for guild %s listed deleted role(s) %s; removed them from the list.",
+                guild.id,
+                missing_ids,
+            )
+
+        notes: list[str] = []
+        if missing_ids:
+            ids_txt = ", ".join(f"`{rid}`" for rid in missing_ids)
+            notes.append(f"Removed deleted role(s) from the autorole list: {ids_txt}.")
+        if blocked:
+            blocked_txt = ", ".join(r.mention for r in blocked)
+            notes.append(
+                f"Skipped (managed, or at/above my top role): {blocked_txt}. "
+                "Move my role above them or use `/autorole remove`."
+            )
+        notes_txt = ("\n" + "\n".join(notes)) if notes else ""
+
+        if not roles:
+            logger.warning(
+                "No assignable autoroles for guild %s (deleted: %s, blocked: %s).",
+                guild.id,
+                missing_ids,
+                [r.id for r in blocked],
             )
             await self._notify(
-                member.guild,
+                guild,
                 self._build_embed(
                     member,
                     title="Autorole failed",
                     description=(
-                        f"couldn't give {member.mention} a role: the configured autorole "
-                        f"(`{role_id}`) no longer exists. Use `/autorole set` to pick a new one."
+                        f"couldn't give {member.mention} any roles: none of the "
+                        f"configured autoroles can be assigned.{notes_txt}"
                     ),
                     color=FAIL_COLOR,
                 ),
             )
             return
 
+        roles_txt = ", ".join(r.mention for r in roles)
         try:
-            await member.add_roles(role, reason="Autorole on join")
+            await member.add_roles(*roles, reason="Autorole on join")
         except discord.Forbidden:
             logger.warning(
-                "Missing permissions to assign autorole %s in guild %s.",
-                role.id,
-                member.guild.id,
+                "Missing permissions to assign autoroles %s in guild %s.",
+                [r.id for r in roles],
+                guild.id,
             )
             await self._notify(
-                member.guild,
+                guild,
                 self._build_embed(
                     member,
                     title="Autorole failed",
                     description=(
-                        f"couldn't give {member.mention} the role {role.mention}: I'm missing "
+                        f"couldn't give {member.mention} the role(s) {roles_txt}: I'm missing "
                         "permissions. Make sure I have **Manage Roles** and my top role sits "
-                        "above it."
+                        f"above them.{notes_txt}"
                     ),
                     color=FAIL_COLOR,
                 ),
             )
         except discord.HTTPException as e:
             logger.warning(
-                "Failed to assign autorole %s to %s in guild %s: %s",
-                role.id,
+                "Failed to assign autoroles %s to %s in guild %s: %s",
+                [r.id for r in roles],
                 member.id,
-                member.guild.id,
+                guild.id,
                 e,
             )
             await self._notify(
-                member.guild,
+                guild,
                 self._build_embed(
                     member,
                     title="Autorole failed",
-                    description=f"couldn't give {member.mention} the role {role.mention}: `{e}`",
+                    description=(
+                        f"couldn't give {member.mention} the role(s) {roles_txt}: `{e}`{notes_txt}"
+                    ),
                     color=FAIL_COLOR,
                 ),
             )
         else:
             await self._notify(
-                member.guild,
+                guild,
                 self._build_embed(
                     member,
-                    title="Autorole assigned",
-                    description=f"gave {role.mention} to {member.mention} on join.",
+                    title="Autorole partly assigned" if notes else "Autorole assigned",
+                    description=f"gave {roles_txt} to {member.mention} on join.{notes_txt}",
                     color=SUCCESS_COLOR,
                 ),
             )
