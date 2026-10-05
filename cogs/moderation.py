@@ -13,7 +13,8 @@ Ported from another bot into Rosarium's house style:
   - Commands are hybrid (slash + prefix) to match the rest of the bot,
     except `clear`/`purge`, which stays prefix-only because its argument
     is a free-form mini-syntax ("bots" / "user @x" / "contains word" / a
-    number) that doesn't map cleanly onto a single slash option.
+    number) that doesn't map cleanly onto a single slash option, and
+    `massrole`, which takes a variable number of roles.
 
 Note on snipe/editsnipe: this cog owns both commands now. They used to
 also exist in utility.py (a rolling per-channel cache, open to everyone);
@@ -91,12 +92,54 @@ def _mod_embed(title: str, color: int, fields: list[tuple]) -> discord.Embed:
     return embed
 
 
+# Roles carrying any of these permissions can't be mass-assigned: handing
+# them to every member at once would effectively hand over the server.
+_MASSROLE_BLOCKED_PERMS = (
+    "administrator",
+    "manage_guild",
+    "manage_roles",
+    "manage_channels",
+    "kick_members",
+    "ban_members",
+    "moderate_members",
+    "mention_everyone",
+)
+
+
+class _ConfirmView(discord.ui.View):
+    """Confirm / Cancel buttons that only the invoking moderator can press."""
+
+    def __init__(self, author_id: int):
+        super().__init__(timeout=30)
+        self.author_id = author_id
+        self.value = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("This prompt isn't for you.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.value = True
+        await interaction.response.defer()
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.value = False
+        await interaction.response.defer()
+        self.stop()
+
+
 # ---------- COG ----------
 
 
 class Moderation(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self._massrole_guilds: set[int] = set()
 
     async def cog_check(self, ctx: commands.Context) -> bool:
         # Everything in this cog assumes a guild (roles, members, channels).
@@ -531,7 +574,8 @@ class Moderation(commands.Cog):
                 f"`{prefix}ban` — Permanently ban a member\n"
                 f"`{prefix}unban` — Unban a user by ID\n"
                 f"`{prefix}kick` — Kick a member\n"
-                f"`{prefix}softban` — Ban + unban to clear messages"
+                f"`{prefix}softban` — Ban + unban to clear messages\n"
+                f"`{prefix}massrole` — Give role(s) to every member"
             ),
             inline=False,
         )
@@ -707,6 +751,109 @@ class Moderation(commands.Cog):
                 ("Moderator", ctx.author.mention),
             ]
         ))
+
+    # ---------- MASSROLE (Mod only) ----------
+    # Prefix-only: a variable number of roles doesn't map onto one slash option.
+
+    @commands.command(
+        name="massrole",
+        description="Give one or more roles to every member of the server. Prefix-only.",
+    )
+    @has_mod_role()
+    async def massrole(self, ctx: commands.Context, *roles: discord.Role):
+        if not roles:
+            return await ctx.send(f"Usage: `{config.COMMAND_PREFIX}massrole <@role> [@role ...]`")
+
+        roles = list(dict.fromkeys(roles))  # drop duplicates, keep order
+        guild = ctx.guild
+        me = guild.me
+
+        if guild.id in self._massrole_guilds:
+            return await ctx.send("A mass role operation is already running in this server.")
+
+        if not me.guild_permissions.manage_roles:
+            return await ctx.send("I need the **Manage Roles** permission to do that.")
+
+        trusted = ctx.author.id == guild.owner_id or await ctx.bot.is_owner(ctx.author)
+        for role in roles:
+            if role.is_default():
+                return await ctx.send("`@everyone` can't be assigned.")
+            if role.managed:
+                return await ctx.send(f"{role.mention} is managed by an integration and can't be assigned.")
+            if role >= me.top_role:
+                return await ctx.send(f"{role.mention} is at or above my highest role, so I can't assign it.")
+            if not trusted and role >= ctx.author.top_role:
+                return await ctx.send(f"{role.mention} is at or above your highest role.")
+            blocked = [p for p in _MASSROLE_BLOCKED_PERMS if getattr(role.permissions, p)]
+            if blocked:
+                names = ", ".join(p.replace("_", " ") for p in blocked)
+                return await ctx.send(
+                    f"{role.mention} has dangerous permissions ({names}) and can't be given to everyone."
+                )
+
+        if not guild.chunked:
+            await guild.chunk()
+
+        targets = []
+        for member in guild.members:
+            missing = [r for r in roles if r not in member.roles]
+            if missing:
+                targets.append((member, missing))
+
+        role_mentions = " ".join(r.mention for r in roles)
+        if not targets:
+            return await ctx.send(f"Everyone already has {role_mentions}.")
+
+        # Confirm before touching every member.
+        view = _ConfirmView(ctx.author.id)
+        prompt = await ctx.send(
+            embed=_mod_embed(
+                "Confirm Mass Role",
+                config.EMBED_COLOR,
+                [
+                    ("Roles", role_mentions),
+                    ("Members affected", f"**{len(targets)}** of {len(guild.members)}"),
+                ],
+            ),
+            view=view,
+        )
+        await view.wait()
+        if view.value is not True:
+            await prompt.edit(content="Cancelled." if view.value is False else "Timed out.", embed=None, view=None)
+            return
+
+        reason = f"Massrole by {ctx.author}"
+        done = failed = 0
+        self._massrole_guilds.add(guild.id)
+        try:
+            for i, (member, missing) in enumerate(targets, 1):
+                try:
+                    await member.add_roles(*missing, reason=reason)
+                    done += 1
+                except discord.HTTPException:
+                    failed += 1
+
+                if i % 25 == 0:
+                    await prompt.edit(
+                        content=f"Assigning roles… **{i}/{len(targets)}**",
+                        embed=None,
+                        view=None,
+                    )
+        finally:
+            self._massrole_guilds.discard(guild.id)
+
+        fields = [
+            ("Roles", role_mentions),
+            ("Assigned to", f"**{done}** member(s)"),
+        ]
+        if failed:
+            fields.append(("Failed", f"**{failed}** member(s)"))
+        fields.append(("Moderator", ctx.author.mention))
+        await prompt.edit(
+            content=None,
+            embed=_mod_embed("Mass Role Complete", config.EMBED_COLOR_DARK, fields),
+            view=None,
+        )
 
     # ---------- ROLELIST ----------
 

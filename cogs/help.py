@@ -306,6 +306,13 @@ def build_pages(bot: commands.Bot) -> list[Page]:
                 f"`{p}rolepurge <@user>` {DIV} strip every removable role\n"
                 f"`{p}rolelist` {DIV} paginated list of all server roles",
             ),
+            (
+                "🔴  Mass roles",
+                f"`{p}massrole <@role> [@role …]` {DIV} give role(s) to every member — **prefix only**\n"
+                f"┣ Asks for confirmation first and skips anyone who already has them\n"
+                f"┗ *Refuses `@everyone`, managed roles, roles above Rosarium or you, "
+                f"and roles with dangerous permissions.*",
+            ),
         ],
     )
 
