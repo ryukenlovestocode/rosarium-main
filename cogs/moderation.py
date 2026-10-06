@@ -19,10 +19,33 @@ Ported from another bot into Rosarium's house style:
 Note on snipe/editsnipe: this cog owns both commands now. They used to
 also exist in utility.py (a rolling per-channel cache, open to everyone);
 that version has been removed so there's a single snipe implementation.
-This one only remembers the single most recent deleted/edited message per
-channel, and is gated behind a mod role rather than public — a smaller,
-staff-facing tool rather than a public toy. In-memory only, same as AFK
-in utility.py: it doesn't need to survive a restart.
+This one is a staff-facing investigation tool, not a public toy, and it
+is built so a spammer can't bury evidence by deleting a pile of messages:
+  - Every channel keeps a rolling history (SNIPE_DEPTH entries for
+    SNIPE_TTL) of deleted messages and, separately, edited ones — not just
+    the single most recent.
+  - Messages removed by a bulk delete (`clear`/`purge`) are kept too,
+    tagged as purged. Attachments, stickers and reply targets are kept.
+  - `snipe` / `editsnipe` take a small mini-syntax in one argument:
+        $s                       the latest
+        $s 3 | $s 2-6            the 3rd most recent | a range (as a list)
+        $s 15m                   only the last 15 minutes (s/m/h/d)
+        $s contains <word>       text/filename search (always goes last)
+        $s user <@user|id>       everything one person deleted
+        $s files | $s purged     only attachments | only purged messages
+        $s in <#channel> | all   another channel | the whole server
+        $s list | top | export | clear | help
+    Filters stack (`$s user @x files last 1h`). Results open in a browser
+    with Newer/Older/First/Last buttons and a List/Detail toggle. "#N" in
+    any result is its serial number in the cache, i.e. `$s N` reopens it.
+  - Staff only ever see channels they could view themselves, so snipe
+    can't be used to read a private channel.
+  - Command invocations in SNIPE_IGNORED_COMMANDS are never recorded. This
+    matters for `confess` in fun.py: it deletes the invoking message right
+    away, and without this the snipe cache would unmask the confessor.
+  - In-memory only, same as AFK in utility.py: it doesn't need to survive
+    a restart. Only messages Discord's message cache still holds (i.e. the
+    bot saw them arrive) can be recorded.
 
 Note on warnings: also in-memory. If you want warnings to survive a
 restart, swap `mod_warnings` for a storage.JSONStore instance (see
@@ -31,13 +54,32 @@ would need to change.
 """
 
 import asyncio
-from collections import defaultdict
+import io
+import math
+import re
+from collections import Counter, defaultdict, deque
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from typing import Optional
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 
 import config
+
+# ---------- SNIPE SETTINGS ----------
+
+SNIPE_DEPTH = 100                    # entries remembered per channel (deleted and edited, separately)
+SNIPE_TTL = timedelta(hours=24)      # entries older than this are forgotten
+SNIPE_PER_PAGE = 8                   # rows per page in list mode
+SNIPE_VIEW_TIMEOUT = 120.0           # seconds the browser buttons stay live
+SNIPE_BURST_COUNT = 5                # this many deletions/edits ...
+SNIPE_BURST_WINDOW = 120             # ... within this many seconds = flagged in `top`
+# Commands whose invoking message must never be recorded. `confess` deletes
+# the user's message immediately to stay anonymous; `clear` deletes the
+# moderator's own command. (Aliases resolve to these names automatically.)
+SNIPE_IGNORED_COMMANDS = {"confess", "clear"}
 
 # ---------- PERMISSION CHECKS ----------
 
@@ -75,9 +117,607 @@ def has_mod_role():
     return commands.check(predicate)
 
 
+# ---------- SNIPE DATA ----------
+
+
+@dataclass
+class SnipeEntry:
+    """One remembered deleted or edited message."""
+
+    kind: str                       # "delete" | "edit"
+    message_id: int
+    channel_id: int
+    guild_id: int
+    author_id: int
+    author_name: str
+    avatar_url: str
+    content: str                    # the deleted text — or, for an edit, the NEW text
+    before: str = ""                # edits only: the old text
+    attachments: list = field(default_factory=list)   # [(filename, url, content_type)]
+    stickers: list = field(default_factory=list)      # [sticker name]
+    reply_to: Optional[str] = None
+    jump_url: str = ""
+    sent_at: datetime = field(default_factory=discord.utils.utcnow)   # when the message was posted
+    time: datetime = field(default_factory=discord.utils.utcnow)      # when it was deleted / edited
+    purged: bool = False            # removed by a bulk delete rather than individually
+
+
+# Newest entry first: index 0 is "#1". appendleft + maxlen drops the oldest.
+sniped_messages: dict[int, deque] = defaultdict(lambda: deque(maxlen=SNIPE_DEPTH))
+edited_messages: dict[int, deque] = defaultdict(lambda: deque(maxlen=SNIPE_DEPTH))
+
+
+def _prune(store: dict) -> None:
+    """Forget entries older than SNIPE_TTL (and empty channels)."""
+    cutoff = discord.utils.utcnow() - SNIPE_TTL
+    for cid in list(store):
+        dq = store[cid]
+        while dq and dq[-1].time < cutoff:
+            dq.pop()
+        if not dq:
+            del store[cid]
+
+
+def _snapshot_delete(message: discord.Message, *, purged: bool = False) -> SnipeEntry:
+    reply_to = None
+    ref = message.reference
+    if ref is not None:
+        resolved = ref.resolved
+        if isinstance(resolved, discord.Message):
+            reply_to = f"{resolved.author.mention} — [jump]({resolved.jump_url})"
+        elif ref.message_id:
+            reply_to = f"a message (`{ref.message_id}`)"
+
+    return SnipeEntry(
+        kind="delete",
+        message_id=message.id,
+        channel_id=message.channel.id,
+        guild_id=message.guild.id,
+        author_id=message.author.id,
+        author_name=str(message.author),
+        avatar_url=message.author.display_avatar.url,
+        content=message.content or "",
+        attachments=[(a.filename, a.url, a.content_type or "") for a in message.attachments],
+        stickers=[s.name for s in message.stickers],
+        reply_to=reply_to,
+        jump_url=message.jump_url,
+        sent_at=message.created_at,
+        purged=purged,
+    )
+
+
+def _snapshot_edit(before: discord.Message, after: discord.Message) -> SnipeEntry:
+    return SnipeEntry(
+        kind="edit",
+        message_id=after.id,
+        channel_id=after.channel.id,
+        guild_id=after.guild.id,
+        author_id=before.author.id,
+        author_name=str(before.author),
+        avatar_url=before.author.display_avatar.url,
+        content=after.content or "",
+        before=before.content or "",
+        jump_url=after.jump_url,
+        sent_at=before.created_at,
+    )
+
+
+# ---------- SNIPE QUERY ----------
+
+
+class SnipeQueryError(Exception):
+    """A problem with what the moderator typed — shown to them, not logged."""
+
+
+@dataclass
+class SnipeQuery:
+    index: Optional[int] = None               # `$s 3`
+    span: Optional[tuple] = None              # `$s 2-6`
+    keyword: Optional[str] = None             # `$s contains word` (stored lowercase)
+    user_id: Optional[int] = None             # `$s user @x`
+    channel: Optional[discord.abc.GuildChannel] = None   # `$s in #chan`
+    everywhere: bool = False                  # `$s all`
+    files_only: bool = False                  # `$s files`
+    purged_only: bool = False                 # `$s purged`
+    max_age: Optional[timedelta] = None       # `$s 15m`
+    mode: str = "detail"                      # "detail" | "list"
+    action: str = "view"                      # "view" | "stats" | "export" | "clear" | "help"
+
+
+_KW_CONTAINS = {"contains", "contain", "has", "with", "match", "find", "search", "c"}
+_KW_USER = {"user", "from", "by", "u"}
+_KW_CHANNEL = {"in", "channel", "ch"}
+_KW_ALL = {"all", "server", "global", "guild", "everywhere"}
+_KW_FILES = {"files", "file", "attachments", "attachment", "media", "images", "image", "pics"}
+_KW_PURGED = {"purged", "purge", "bulk", "cleared"}
+_KW_AGE = {"last", "within", "since", "ago"}
+_KW_LIST = {"list", "ls", "log", "history", "l"}
+_KW_STATS = {"top", "stats", "stat", "leaderboard", "lb"}
+_KW_EXPORT = {"export", "dump", "save"}
+_KW_CLEAR = {"clear", "wipe", "reset"}
+
+_ID_RE = re.compile(r"^(?:<@!?(\d{15,25})>|(\d{15,25}))$")
+_CHANNEL_MENTION_RE = re.compile(r"^<#(\d{15,25})>$")
+_RANGE_RE = re.compile(r"^(\d{1,3})(?:-|\.\.)(\d{1,3})$")
+_DUR_RE = re.compile(r"^(\d{1,4})([smhd])$")
+_UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+def _parse_duration(token: str) -> timedelta:
+    m = _DUR_RE.match(token.lower())
+    if not m or int(m.group(1)) == 0:
+        raise SnipeQueryError(f"`{token}` isn't a duration — use something like `30s`, `15m`, `2h` or `1d`.")
+    return timedelta(seconds=int(m.group(1)) * _UNIT_SECONDS[m.group(2)])
+
+
+def _fmt_duration(td: timedelta) -> str:
+    secs = int(td.total_seconds())
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if secs >= size and secs % size == 0:
+            return f"{secs // size}{unit}"
+    return f"{secs}s"
+
+
+def _snipe_matches(entry: SnipeEntry, q: SnipeQuery, now: datetime) -> bool:
+    if q.user_id is not None and entry.author_id != q.user_id:
+        return False
+    if q.files_only and not entry.attachments:
+        return False
+    if q.purged_only and not entry.purged:
+        return False
+    if q.max_age is not None and now - entry.time > q.max_age:
+        return False
+    if q.keyword:
+        haystack = "\n".join([entry.before, entry.content, *(fn for fn, _, _ in entry.attachments)]).lower()
+        if q.keyword not in haystack:
+            return False
+    return True
+
+
+def _describe_query(q: SnipeQuery) -> str:
+    bits = []
+    if q.keyword:
+        bits.append(f'containing "{discord.utils.escape_mentions(q.keyword)}"')
+    if q.user_id is not None:
+        bits.append(f"from user `{q.user_id}`")
+    if q.files_only:
+        bits.append("with attachments")
+    if q.purged_only:
+        bits.append("that were purged")
+    if q.max_age is not None:
+        bits.append(f"in the last {_fmt_duration(q.max_age)}")
+    return ", ".join(bits) or "no filters"
+
+
+def _guild_channel(guild: discord.Guild, channel_id: int):
+    getter = getattr(guild, "get_channel_or_thread", guild.get_channel)
+    return getter(channel_id)
+
+
+def _can_view(channel, member: discord.Member) -> bool:
+    perms = channel.permissions_for(member)
+    return bool(perms.view_channel and perms.read_message_history)
+
+
+# ---------- SNIPE EMBEDS ----------
+
+
+def _clip(text: str, limit: int) -> str:
+    text = text or ""
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _one_line(text: str, limit: int) -> str:
+    flat = _clip(" ".join((text or "").split()), limit)
+    return discord.utils.escape_markdown(discord.utils.escape_mentions(flat))
+
+
+def _snipe_detail_embed(
+    entry: SnipeEntry, rank: int, total: int, pos: int, count: int, requester: str
+) -> discord.Embed:
+    is_edit = entry.kind == "edit"
+    if is_edit:
+        title = "Edit Sniped"
+    else:
+        title = "Sniped Message · Purged" if entry.purged else "Sniped Message"
+
+    embed = discord.Embed(title=title, color=config.EMBED_COLOR_DARK, timestamp=entry.time)
+    embed.set_author(name=entry.author_name, icon_url=entry.avatar_url)
+
+    if is_edit:
+        embed.add_field(name="Before", value=_clip(entry.before, 1000) or "*[No text]*", inline=False)
+        embed.add_field(name="After", value=_clip(entry.content, 1000) or "*[No text]*", inline=False)
+    else:
+        if entry.content:
+            embed.description = _clip(entry.content, 4000)
+        elif entry.attachments or entry.stickers:
+            embed.description = "*[No text — attachment only]*"
+        else:
+            embed.description = "*[No text content]*"
+
+    verb = "Edited" if is_edit else "Deleted"
+    embed.add_field(name="Author", value=f"<@{entry.author_id}>\n`{entry.author_id}`", inline=True)
+    embed.add_field(name="Channel", value=f"<#{entry.channel_id}>", inline=True)
+    embed.add_field(
+        name="Timing",
+        value=(
+            f"Sent {discord.utils.format_dt(entry.sent_at, 'R')}\n"
+            f"{verb} {discord.utils.format_dt(entry.time, 'R')}"
+        ),
+        inline=True,
+    )
+    embed.add_field(name="Message ID", value=f"`{entry.message_id}`", inline=True)
+    if is_edit and entry.jump_url:
+        embed.add_field(name="Message", value=f"[Jump to message]({entry.jump_url})", inline=True)
+
+    if entry.attachments:
+        lines, used = [], 0
+        for idx, (filename, url, _ctype) in enumerate(entry.attachments):
+            name = _clip(discord.utils.escape_markdown(filename), 40)
+            line = f"📎 [{name}]({url})"
+            if used + len(line) + 1 > 950:
+                lines.append(f"…and {len(entry.attachments) - idx} more")
+                break
+            lines.append(line)
+            used += len(line) + 1
+        embed.add_field(name=f"Attachments ({len(entry.attachments)})", value="\n".join(lines), inline=False)
+        for _filename, url, ctype in entry.attachments:
+            if ctype.startswith("image/"):
+                embed.set_image(url=url)
+                break
+
+    if entry.stickers:
+        embed.add_field(name="Stickers", value=_clip(", ".join(entry.stickers), 1000), inline=True)
+    if entry.reply_to:
+        embed.add_field(name="Replying to", value=_clip(entry.reply_to, 1000), inline=True)
+
+    parts = [config.FOOTER_TEXT, "edited message" if is_edit else "deleted message", f"#{rank} of {total}"]
+    if count != total:
+        parts.append(f"match {pos + 1}/{count}")
+    parts.append(f"asked by {requester}")
+    embed.set_footer(text=" • ".join(parts))
+    return embed
+
+
+def _snipe_list_embed(
+    results: list, page: int, kind: str, total: int, scope: str, requester: str
+) -> discord.Embed:
+    is_edit = kind == "edit"
+    short = f"{config.COMMAND_PREFIX}{'es' if is_edit else 's'}"
+    pages = max(1, math.ceil(len(results) / SNIPE_PER_PAGE))
+    chunk = results[page * SNIPE_PER_PAGE:(page + 1) * SNIPE_PER_PAGE]
+
+    lines = []
+    for rank, e in chunk:
+        flags = ""
+        if e.attachments:
+            flags += f" 📎{len(e.attachments)}"
+        if e.purged:
+            flags += " 🧹"
+        if is_edit:
+            text = f"{_one_line(e.before, 45) or '∅'} → {_one_line(e.content, 45) or '∅'}"
+        else:
+            text = _one_line(e.content, 90) or (
+                "*[attachment only]*" if e.attachments or e.stickers else "*[no text]*"
+            )
+        lines.append(
+            f"`#{rank:<3}` {discord.utils.format_dt(e.time, 'R')} · <@{e.author_id}> · <#{e.channel_id}>{flags}\n> {text}"
+        )
+
+    header = f"{scope} — newest first. Open one with `{short} <#>`.\n\n"
+    embed = discord.Embed(
+        title="Edit Snipe Log" if is_edit else "Snipe Log",
+        description=header + ("\n".join(lines) or "*Nothing on this page.*"),
+        color=config.EMBED_COLOR_DARK,
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.set_footer(
+        text=f"{config.FOOTER_TEXT} • page {page + 1}/{pages} • {len(results)} of {total} shown • asked by {requester}"
+    )
+    return embed
+
+
+def _peak_burst(times: list) -> int:
+    """Most events inside any SNIPE_BURST_WINDOW-second window (times ascending)."""
+    best = lo = 0
+    for hi, t in enumerate(times):
+        while (t - times[lo]).total_seconds() > SNIPE_BURST_WINDOW:
+            lo += 1
+        best = max(best, hi - lo + 1)
+    return best
+
+
+def _snipe_stats_embed(entries: list, kind: str, scope: str, requester: str) -> discord.Embed:
+    is_edit = kind == "edit"
+    noun = "edits" if is_edit else "deletions"
+    who = "editors" if is_edit else "deleters"
+
+    embed = discord.Embed(
+        title=f"Snipe Stats — {'Edits' if is_edit else 'Deletions'}",
+        color=config.EMBED_COLOR_DARK,
+        timestamp=discord.utils.utcnow(),
+    )
+
+    overview = [
+        f"**{len(entries)}** {noun} cached — {scope}",
+        f"Newest {discord.utils.format_dt(entries[0].time, 'R')} · oldest {discord.utils.format_dt(entries[-1].time, 'R')}",
+    ]
+    with_files = sum(1 for e in entries if e.attachments)
+    purged = sum(1 for e in entries if e.purged)
+    if with_files:
+        overview.append(f"📎 {with_files} had attachments")
+    if purged:
+        overview.append(f"🧹 {purged} removed by a purge")
+    embed.add_field(name="Overview", value="\n".join(overview), inline=False)
+
+    by_author = Counter(e.author_id for e in entries)
+    top = []
+    for pos, (uid, count) in enumerate(by_author.most_common(5), 1):
+        extras = []
+        author_purged = sum(1 for e in entries if e.author_id == uid and e.purged)
+        author_files = sum(1 for e in entries if e.author_id == uid and e.attachments)
+        if author_purged:
+            extras.append(f"{author_purged} purged")
+        if author_files:
+            extras.append(f"{author_files} with files")
+        suffix = f" ({', '.join(extras)})" if extras else ""
+        top.append(f"`{pos}.` <@{uid}> — **{count}**{suffix}")
+    embed.add_field(name=f"Top {who}", value="\n".join(top), inline=False)
+
+    times_by_author = defaultdict(list)
+    for e in entries:
+        if not e.purged:
+            times_by_author[e.author_id].append(e.time)
+    alerts = []
+    for uid, times in times_by_author.items():
+        times.sort()
+        peak = _peak_burst(times)
+        if peak >= SNIPE_BURST_COUNT:
+            alerts.append((peak, uid))
+    if alerts:
+        alerts.sort(reverse=True)
+        lines = [f"🚨 <@{uid}> — **{peak}** {noun} within {SNIPE_BURST_WINDOW}s" for peak, uid in alerts[:5]]
+        embed.add_field(name=f"Rapid {who}", value="\n".join(lines), inline=False)
+
+    by_channel = Counter(e.channel_id for e in entries)
+    if len(by_channel) > 1:
+        lines = [f"<#{cid}> — **{n}**" for cid, n in by_channel.most_common(5)]
+        embed.add_field(name="Busiest channels", value="\n".join(lines), inline=False)
+
+    embed.set_footer(text=f"{config.FOOTER_TEXT} • snipe stats • asked by {requester}")
+    return embed
+
+
+def _indent(text: str) -> str:
+    lines = (text or "").splitlines() or ["[no text]"]
+    return "\n".join(f"      {ln}" for ln in lines)
+
+
+def _snipe_export_text(results: list, kind: str, guild: discord.Guild, scope: str, requester: str) -> str:
+    is_edit = kind == "edit"
+    now = discord.utils.utcnow()
+    out = [
+        f"{config.BOT_NAME} snipe export — {'edited' if is_edit else 'deleted'} messages",
+        f"Server:    {guild.name} ({guild.id})",
+        f"Scope:     {scope}",
+        f"Generated: {now:%Y-%m-%d %H:%M:%S} UTC, requested by {requester}",
+        f"Entries:   {len(results)} (newest first; #N is the serial number in the cache)",
+        "=" * 64,
+        "",
+    ]
+    for rank, e in results:
+        ch = _guild_channel(guild, e.channel_id)
+        ch_name = f"#{ch.name}" if ch is not None else str(e.channel_id)
+        tag = "EDIT" if is_edit else ("DELETE (purged)" if e.purged else "DELETE")
+        out.append(f"#{rank}  [{e.time:%Y-%m-%d %H:%M:%S} UTC]  {ch_name}  {tag}")
+        out.append(f"    Author:     {e.author_name} ({e.author_id})")
+        out.append(f"    Message ID: {e.message_id}")
+        out.append(f"    Sent:       {e.sent_at:%Y-%m-%d %H:%M:%S} UTC")
+        if e.reply_to:
+            out.append("    Reply:      (replying to another message)")
+        if is_edit:
+            out.append("    Before:")
+            out.append(_indent(e.before))
+            out.append("    After:")
+            out.append(_indent(e.content))
+        else:
+            out.append("    Content:")
+            out.append(_indent(e.content))
+        for filename, url, _ctype in e.attachments:
+            out.append(f"    Attachment: {filename} — {url}")
+        if e.stickers:
+            out.append(f"    Stickers:   {', '.join(e.stickers)}")
+        out.append("")
+    return "\n".join(out)
+
+
+def _snipe_usage_embed(kind: str) -> discord.Embed:
+    p = config.COMMAND_PREFIX
+    is_edit = kind == "edit"
+    short = f"{p}es" if is_edit else f"{p}s"
+    full = f"{p}editsnipe" if is_edit else f"{p}snipe"
+    what = "edited" if is_edit else "deleted"
+    hours = int(SNIPE_TTL.total_seconds() // 3600)
+
+    embed = discord.Embed(
+        title=f"{'Edit snipe' if is_edit else 'Snipe'} — Syntax",
+        description=(
+            f"Every {what} message is remembered per channel — up to **{SNIPE_DEPTH}** of them, "
+            f"for **{hours}h**. `{short}` is the short form of `{full}`.\n"
+            f"Anything you type after the command is a mix of the options below."
+        ),
+        color=config.EMBED_COLOR_DARK,
+    )
+    embed.add_field(
+        name="Pick a message",
+        value=(
+            f"`{short}` — the latest\n"
+            f"`{short} 3` — the 3rd most recent (`#N` in a result = `{short} N`)\n"
+            f"`{short} 2-6` — a range, shown as a list\n"
+            f"`{short} 15m` — only the last 15 minutes (`s` `m` `h` `d`)"
+        ),
+        inline=False,
+    )
+    filters = [
+        f"`{short} contains <word>` — text search (**put it last**, it takes the rest of the line)",
+        f"`{short} user <@user|id>` — one person's messages",
+    ]
+    if not is_edit:
+        filters += [
+            f"`{short} files` — only messages with attachments",
+            f"`{short} purged` — only messages removed by `{p}clear`",
+        ]
+    filters += [
+        f"`{short} in <#channel>` — another channel",
+        f"`{short} all` — every channel you can see",
+    ]
+    embed.add_field(name="Filters (stackable)", value="\n".join(filters), inline=False)
+    embed.add_field(
+        name="Tools",
+        value=(
+            f"`{short} list` — compact log\n"
+            f"`{short} top` — who {'edits' if is_edit else 'deletes'} the most, with rapid-fire alerts\n"
+            f"`{short} export` — the results as a .txt file (sent privately)\n"
+            f"`{short} clear` — forget the matching entries (**Mod** only, asks first)"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Examples",
+        value=(
+            f"`{short} user @troll files last 1h`\n"
+            f"`{short} all contains discord.gg`\n"
+            f"`{short} in #general 5`"
+        ),
+        inline=False,
+    )
+    embed.set_footer(text=config.FOOTER_TEXT)
+    return embed
+
+
+# ---------- SNIPE BROWSER ----------
+
+
+class SnipeView(discord.ui.View):
+    """Detail/List browser over a set of snipe results. Only the asker can press."""
+
+    def __init__(
+        self,
+        *,
+        author_id: int,
+        results: list,
+        kind: str,
+        total: int,
+        scope: str,
+        requester: str,
+        start: int = 0,
+        mode: str = "detail",
+    ):
+        super().__init__(timeout=SNIPE_VIEW_TIMEOUT)
+        self.author_id = author_id
+        self.results = results
+        self.kind = kind
+        self.total = total
+        self.scope = scope
+        self.requester = requester
+        self.index = start
+        self.mode = mode
+        self.message: Optional[discord.Message] = None
+        self._sync()
+
+    @property
+    def pages(self) -> int:
+        return max(1, math.ceil(len(self.results) / SNIPE_PER_PAGE))
+
+    @property
+    def page(self) -> int:
+        return self.index // SNIPE_PER_PAGE
+
+    def current_embed(self) -> discord.Embed:
+        if self.mode == "list":
+            return _snipe_list_embed(self.results, self.page, self.kind, self.total, self.scope, self.requester)
+        rank, entry = self.results[self.index]
+        return _snipe_detail_embed(entry, rank, self.total, self.index, len(self.results), self.requester)
+
+    def _sync(self) -> None:
+        count = len(self.results)
+        if self.mode == "list":
+            at_start, at_end = self.page == 0, self.page >= self.pages - 1
+            self.btn_mode.label, self.btn_mode.emoji = "Detail", "🔍"
+        else:
+            at_start, at_end = self.index == 0, self.index >= count - 1
+            self.btn_mode.label, self.btn_mode.emoji = "List", "📋"
+        self.btn_first.disabled = self.btn_newer.disabled = at_start
+        self.btn_older.disabled = self.btn_last.disabled = at_end
+        self.btn_mode.disabled = count <= 1
+
+    async def _refresh(self, interaction: discord.Interaction) -> None:
+        self._sync()
+        await interaction.response.edit_message(embed=self.current_embed(), view=self)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "This browser isn't yours — run the command yourself.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(emoji="⏮️", style=discord.ButtonStyle.secondary, row=0)
+    async def btn_first(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.index = 0
+        await self._refresh(interaction)
+
+    @discord.ui.button(label="Newer", emoji="◀️", style=discord.ButtonStyle.secondary, row=0)
+    async def btn_newer(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.mode == "list":
+            self.index = max(0, self.page - 1) * SNIPE_PER_PAGE
+        else:
+            self.index = max(0, self.index - 1)
+        await self._refresh(interaction)
+
+    @discord.ui.button(label="Older", emoji="▶️", style=discord.ButtonStyle.secondary, row=0)
+    async def btn_older(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.mode == "list":
+            self.index = min(self.page + 1, self.pages - 1) * SNIPE_PER_PAGE
+        else:
+            self.index = min(self.index + 1, len(self.results) - 1)
+        await self._refresh(interaction)
+
+    @discord.ui.button(emoji="⏭️", style=discord.ButtonStyle.secondary, row=0)
+    async def btn_last(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.mode == "list":
+            self.index = (self.pages - 1) * SNIPE_PER_PAGE
+        else:
+            self.index = len(self.results) - 1
+        await self._refresh(interaction)
+
+    @discord.ui.button(label="List", emoji="📋", style=discord.ButtonStyle.primary, row=1)
+    async def btn_mode(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.mode = "detail" if self.mode == "list" else "list"
+        await self._refresh(interaction)
+
+    @discord.ui.button(emoji="✖️", style=discord.ButtonStyle.danger, row=1)
+    async def btn_close(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        try:
+            await interaction.response.defer()
+            if self.message:
+                await self.message.delete()
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+
+
 # ---------- IN-MEMORY STORES ----------
-sniped_messages: dict[int, dict] = {}
-edited_messages: dict[int, dict] = {}
 mod_warnings: dict[int, list[dict]] = defaultdict(list)
 
 
@@ -495,63 +1135,310 @@ class Moderation(commands.Cog):
         embed.set_footer(text=config.FOOTER_TEXT)
         await ctx.send(embed=embed)
 
-    # ---------- SNIPE (Trial Mod+) ----------
+    # ══════════════════════════════════════════
+    #  SNIPE / EDITSNIPE (Trial Mod+)
+    # ══════════════════════════════════════════
+
+    # ---------- RECORDING ----------
+
+    async def _is_ignored_invocation(self, message: discord.Message) -> bool:
+        """True for command messages that must never be recorded (see SNIPE_IGNORED_COMMANDS)."""
+        if not message.content or not message.content.startswith(config.COMMAND_PREFIX):
+            return False
+        try:
+            ctx = await self.bot.get_context(message)
+        except Exception:
+            return False
+        return bool(ctx.valid and ctx.command is not None and ctx.command.qualified_name in SNIPE_IGNORED_COMMANDS)
 
     @commands.Cog.listener()
     async def on_message_delete(self, message: discord.Message):
-        if message.author.bot:
+        if message.guild is None or message.author.bot:
             return
-        sniped_messages[message.channel.id] = {
-            "author": message.author,
-            "content": message.content or "*[No text content]*",
-            "time": datetime.utcnow(),
-            "avatar": message.author.display_avatar.url,
-        }
+        if await self._is_ignored_invocation(message):
+            return
+        sniped_messages[message.channel.id].appendleft(_snapshot_delete(message))
 
-    @commands.hybrid_command(name="snipe", aliases=["s"], description="Show the last deleted message in this channel.")
-    @has_any_mod_role()
-    async def snipe(self, ctx: commands.Context):
-        data = sniped_messages.get(ctx.channel.id)
-        if not data:
-            return await ctx.send("Nothing to snipe here. The dead keep their silence.")
-
-        embed = discord.Embed(
-            title="Sniped Message",
-            description=data["content"],
-            color=config.EMBED_COLOR_DARK,
-            timestamp=data["time"],
-        )
-        embed.set_author(name=str(data["author"]), icon_url=data["avatar"])
-        embed.set_footer(text=f"{config.FOOTER_TEXT} • deleted message")
-        await ctx.send(embed=embed)
-
-    # ---------- EDIT SNIPE (Trial Mod+) ----------
+    @commands.Cog.listener()
+    async def on_bulk_message_delete(self, messages: list):
+        # `clear` / `purge` land here instead of on_message_delete. Oldest
+        # first so the newest message ends up as #1.
+        for message in sorted(messages, key=lambda m: m.created_at):
+            if message.guild is None or message.author.bot:
+                continue
+            if await self._is_ignored_invocation(message):
+                continue
+            sniped_messages[message.channel.id].appendleft(_snapshot_delete(message, purged=True))
 
     @commands.Cog.listener()
     async def on_message_edit(self, before: discord.Message, after: discord.Message):
-        if before.author.bot or before.content == after.content:
+        if before.guild is None or before.author.bot or before.content == after.content:
             return
-        edited_messages[before.channel.id] = {
-            "author": before.author,
-            "before": before.content or "*[No text]*",
-            "after": after.content or "*[No text]*",
-            "time": datetime.utcnow(),
-            "avatar": before.author.display_avatar.url,
-        }
+        edited_messages[before.channel.id].appendleft(_snapshot_edit(before, after))
 
-    @commands.hybrid_command(name="editsnipe", aliases=["es"], description="Show the last edited message in this channel.")
+    # ---------- QUERY PARSING ----------
+
+    async def _resolve_user_id(self, ctx: commands.Context, token: str) -> int:
+        m = _ID_RE.match(token)
+        if m:
+            return int(m.group(1) or m.group(2))
+        try:
+            member = await commands.MemberConverter().convert(ctx, token)
+        except commands.BadArgument:
+            raise SnipeQueryError(f"I couldn't find a member matching `{token}` — use a mention or their ID.")
+        return member.id
+
+    async def _resolve_channel(self, ctx: commands.Context, token: str):
+        try:
+            return await commands.GuildChannelConverter().convert(ctx, token)
+        except commands.BadArgument:
+            raise SnipeQueryError(f"I couldn't find a channel matching `{token}`.")
+
+    async def _parse_snipe_query(self, ctx: commands.Context, raw: Optional[str], kind: str) -> SnipeQuery:
+        q = SnipeQuery()
+        tokens = (raw or "").split()
+        n = len(tokens)
+        i = 0
+
+        def take(what: str) -> str:
+            nonlocal i
+            i += 1
+            if i >= n:
+                raise SnipeQueryError(f"`{tokens[i - 1]}` needs {what} after it.")
+            return tokens[i]
+
+        while i < n:
+            tok = tokens[i]
+            low = tok.lower()
+
+            if low in ("help", "?"):
+                q.action = "help"
+                return q
+
+            if low in _KW_CONTAINS:
+                keyword = " ".join(tokens[i + 1:]).strip()
+                if not keyword:
+                    raise SnipeQueryError(f"`{low}` needs a word or phrase after it.")
+                q.keyword = keyword.lower()
+                break
+
+            if low in _KW_USER:
+                q.user_id = await self._resolve_user_id(ctx, take("a user"))
+            elif low in _KW_CHANNEL:
+                q.channel = await self._resolve_channel(ctx, take("a channel"))
+            elif low in _KW_ALL:
+                q.everywhere = True
+            elif low in _KW_FILES:
+                q.files_only = True
+            elif low in _KW_PURGED:
+                q.purged_only = True
+            elif low in _KW_AGE:
+                q.max_age = _parse_duration(take("a duration like `15m`"))
+            elif low in _KW_LIST:
+                q.mode = "list"
+            elif low in _KW_STATS:
+                q.action = "stats"
+            elif low in _KW_EXPORT:
+                q.action = "export"
+            elif low in _KW_CLEAR:
+                q.action = "clear"
+            elif _DUR_RE.match(low):
+                q.max_age = _parse_duration(low)
+            elif _RANGE_RE.match(low):
+                a, b = (int(x) for x in _RANGE_RE.match(low).groups())
+                if a < 1 or b < a:
+                    raise SnipeQueryError(f"`{tok}` isn't a valid range — numbering starts at 1, e.g. `2-6`.")
+                q.span = (a, b)
+            elif low.isdigit() and len(low) <= 4:
+                if int(low) < 1:
+                    raise SnipeQueryError("Numbering starts at **1** (the latest message).")
+                q.index = int(low)
+            elif _ID_RE.match(tok):
+                q.user_id = int(_ID_RE.match(tok).group(1) or _ID_RE.match(tok).group(2))
+            elif _CHANNEL_MENTION_RE.match(tok):
+                q.channel = await self._resolve_channel(ctx, tok)
+            else:
+                raise SnipeQueryError(f"I don't understand `{tok}`.")
+            i += 1
+
+        if q.everywhere and q.channel is not None:
+            raise SnipeQueryError("Pick either `all` or `in <#channel>`, not both.")
+        if q.index is not None and q.span is not None:
+            raise SnipeQueryError("Use a single number or a range, not both.")
+        if kind == "edit" and (q.files_only or q.purged_only):
+            raise SnipeQueryError("`files` and `purged` only apply to deleted messages.")
+        if q.span is not None:
+            q.mode = "list"
+        return q
+
+    def _gather(self, ctx: commands.Context, store: dict, q: SnipeQuery):
+        """In-scope entries (newest first), a mention-style scope label, and a plain one."""
+        if q.everywhere:
+            pool = []
+            for cid, dq in store.items():
+                channel = _guild_channel(ctx.guild, cid)
+                if channel is None or not _can_view(channel, ctx.author):
+                    continue
+                pool.extend(dq)
+            pool.sort(key=lambda e: e.time, reverse=True)
+            return pool, "the whole server", "server-wide"
+
+        channel = q.channel or ctx.channel
+        if not _can_view(channel, ctx.author):
+            raise SnipeQueryError(f"You can't view {channel.mention}, so you can't snipe it either.")
+        return list(store.get(channel.id, ())), channel.mention, f"#{channel.name}"
+
+    # ---------- RUNNER ----------
+
+    async def _run_snipe(self, ctx: commands.Context, kind: str, raw: Optional[str]):
+        store = sniped_messages if kind == "delete" else edited_messages
+        cmd_name = "snipe" if kind == "delete" else "editsnipe"
+        no_mentions = discord.AllowedMentions.none()
+        _prune(store)
+
+        try:
+            q = await self._parse_snipe_query(ctx, raw, kind)
+            if q.action == "help":
+                return await ctx.send(embed=_snipe_usage_embed(kind))
+            entries, scope, scope_plain = self._gather(ctx, store, q)
+        except SnipeQueryError as exc:
+            return await ctx.send(
+                f"{exc}\nTry `{config.COMMAND_PREFIX}{cmd_name} help` for the syntax.",
+                ephemeral=True,
+                allowed_mentions=no_mentions,
+            )
+
+        total = len(entries)
+        if not total:
+            return await ctx.send(
+                "Nothing to snipe here. The dead keep their silence." if kind == "delete"
+                else "No recently edited messages here."
+            )
+
+        now = discord.utils.utcnow()
+        results = [(rank, e) for rank, e in enumerate(entries, 1) if _snipe_matches(e, q, now)]
+        if not results:
+            return await ctx.send(
+                f"Nothing matched — **{total}** cached, filtered by {_describe_query(q)}.",
+                allowed_mentions=no_mentions,
+            )
+
+        if q.action == "stats":
+            return await ctx.send(
+                embed=_snipe_stats_embed([e for _, e in results], kind, scope, ctx.author.display_name)
+            )
+        if q.action == "export":
+            return await self._send_snipe_export(ctx, kind, results, scope_plain)
+        if q.action == "clear":
+            return await self._clear_snipes(ctx, kind, store, results, scope)
+
+        start, mode = 0, q.mode
+        if q.span is not None:
+            a, b = q.span
+            results = results[a - 1:b]
+            if not results:
+                return await ctx.send(f"There are only **{len(entries)}** cached here — nothing in `{a}-{b}`.")
+        elif q.index is not None:
+            if q.index > len(results):
+                return await ctx.send(
+                    f"Only **{len(results)}** matching message(s) cached — you asked for **#{q.index}**."
+                )
+            start = q.index - 1
+
+        view = SnipeView(
+            author_id=ctx.author.id,
+            results=results,
+            kind=kind,
+            total=total,
+            scope=scope,
+            requester=ctx.author.display_name,
+            start=start,
+            mode=mode,
+        )
+        view.message = await ctx.send(embed=view.current_embed(), view=view)
+
+    async def _send_snipe_export(self, ctx: commands.Context, kind: str, results: list, scope_plain: str):
+        text = _snipe_export_text(results, kind, ctx.guild, scope_plain, str(ctx.author))
+        stamp = discord.utils.utcnow().strftime("%Y%m%d-%H%M%S")
+        filename = f"snipe-{kind}-{stamp}.txt"
+        summary = f"Exported **{len(results)}** {'edit' if kind == 'edit' else 'deletion'} record(s)."
+
+        def make_file() -> discord.File:
+            return discord.File(io.BytesIO(text.encode("utf-8")), filename=filename)
+
+        if ctx.interaction is not None:
+            return await ctx.send(summary, file=make_file(), ephemeral=True)
+
+        # Prefix form: never post deleted content publicly — DM it instead.
+        try:
+            await ctx.author.send(summary, file=make_file())
+        except discord.Forbidden:
+            return await ctx.send("I couldn't DM you the export. Open your DMs and try again.")
+        await ctx.send("📬 Export sent to your DMs — it holds deleted content, so I kept it out of the channel.")
+
+    async def _clear_snipes(self, ctx: commands.Context, kind: str, store: dict, results: list, scope: str):
+        is_owner = await ctx.bot.is_owner(ctx.author)
+        if not (is_owner or (config.MOD_ROLE_ID and config.MOD_ROLE_ID in _member_role_ids(ctx))):
+            return await ctx.send("Clearing snipe history requires the **Mod** role or higher.", ephemeral=True)
+
+        noun = "edit" if kind == "edit" else "deleted-message"
+        doomed = {id(e) for _, e in results}
+        view = _ConfirmView(ctx.author.id)
+        prompt = await ctx.send(
+            embed=_mod_embed(
+                "Confirm Snipe Clear",
+                config.EMBED_COLOR,
+                [("Forgetting", f"**{len(results)}** cached {noun} record(s)"), ("Scope", scope)],
+            ),
+            view=view,
+        )
+        await view.wait()
+        if view.value is not True:
+            await prompt.edit(content="Cancelled." if view.value is False else "Timed out.", embed=None, view=None)
+            return
+
+        removed = 0
+        for cid, dq in list(store.items()):
+            keep = [e for e in dq if id(e) not in doomed]
+            removed += len(dq) - len(keep)
+            dq.clear()
+            dq.extend(keep)
+            if not dq:
+                del store[cid]
+
+        await prompt.edit(
+            content=None,
+            embed=_mod_embed(
+                "Snipe History Cleared",
+                config.EMBED_COLOR_DARK,
+                [("Removed", f"**{removed}** record(s)"), ("Scope", scope), ("Moderator", ctx.author.mention)],
+            ),
+            view=None,
+        )
+
+    # ---------- SNIPE (Trial Mod+) ----------
+
+    @commands.hybrid_command(
+        name="snipe",
+        aliases=["s"],
+        description="Browse deleted messages — by number, keyword, user, and more.",
+    )
+    @app_commands.describe(query="n, contains <word>, user <id>, all, files, last 10m, list, top, export, clear, help")
     @has_any_mod_role()
-    async def editsnipe(self, ctx: commands.Context):
-        data = edited_messages.get(ctx.channel.id)
-        if not data:
-            return await ctx.send("No recently edited messages here.")
+    async def snipe(self, ctx: commands.Context, *, query: str = None):
+        await self._run_snipe(ctx, "delete", query)
 
-        embed = discord.Embed(title="Edit Sniped", color=config.EMBED_COLOR_DARK, timestamp=data["time"])
-        embed.set_author(name=str(data["author"]), icon_url=data["avatar"])
-        embed.add_field(name="Before", value=data["before"], inline=False)
-        embed.add_field(name="After", value=data["after"], inline=False)
-        embed.set_footer(text=f"{config.FOOTER_TEXT} • edited message")
-        await ctx.send(embed=embed)
+    # ---------- EDIT SNIPE (Trial Mod+) ----------
+
+    @commands.hybrid_command(
+        name="editsnipe",
+        aliases=["es"],
+        description="Browse edited messages — by number, keyword, user, and more.",
+    )
+    @app_commands.describe(query="n, contains <word>, user <id>, all, last 10m, list, top, export, clear, help")
+    @has_any_mod_role()
+    async def editsnipe(self, ctx: commands.Context, *, query: str = None):
+        await self._run_snipe(ctx, "edit", query)
 
     # ---------- MODINFO ----------
 
@@ -594,8 +1481,8 @@ class Moderation(commands.Cog):
                 f"`{prefix}nick` — Change a member's nickname\n"
                 f"`{prefix}userinfo / {prefix}whois` — View member info\n"
                 f"`{prefix}serverinfo / {prefix}server` — View server info\n"
-                f"`{prefix}snipe / {prefix}s` — Snipe a deleted message\n"
-                f"`{prefix}editsnipe / {prefix}es` — Snipe an edited message\n"
+                f"`{prefix}snipe / {prefix}s` — Browse deleted messages (`{prefix}s help`)\n"
+                f"`{prefix}editsnipe / {prefix}es` — Browse edited messages\n"
                 f"`{prefix}modinfo` — Show this panel\n"
                 f"`{prefix}newrole` — Create a new role\n"
                 f"`{prefix}role setposition` — Set a role's position\n"

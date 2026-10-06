@@ -22,6 +22,11 @@ fields. Add a command by editing the relevant body string. 🔒 marks an
 owner-only command; ⛓️ tiers inside Moderation mirror the role checks
 in moderation.py (🔴 Mod or owner, 🟡 Trial Mod and above).
 
+Moderation is split across three pages so each stays inside Discord's embed
+limits: Moderation (removals, timeouts, warnings, cleanup, info), Roles
+(role editing, mass roles, role list) and Snipe (the deleted/edited message
+browser and its query syntax). They mirror moderation.py one-to-one.
+
 The Server Setup page covers the slash-only configuration commands
 (/embed, /reactionrole, /autorole, /leavelog). Those are gated by Discord
 permissions (Manage Messages / Manage Roles / Manage Server) rather than
@@ -86,7 +91,9 @@ def build_pages(bot: commands.Bot) -> list[Page]:
                 f"💞 **Fun** {DIV} marriage, ship, confessions, counting\n"
                 f"🌹 **Economy** {DIV} petals, daily, pay, leaderboard\n"
                 f"🎲 **Casino** {DIV} coinflip, dice, wheel, fish, slots, blackjack, rob\n"
-                f"⛓️ **Moderation** {DIV} staff tools, warnings, roles\n"
+                f"⛓️ **Moderation** {DIV} kick, ban, timeouts, warnings, cleanup\n"
+                f"🥀 **Roles** {DIV} role editing, mass roles, role list\n"
+                f"🔎 **Snipe** {DIV} deleted and edited message browser\n"
                 f"🛠️ **Server Setup** {DIV} embeds, reaction roles, autorole, leave log\n"
                 f"🔒 **Owner** {DIV} restart, sticky messages, testing",
             ),
@@ -94,7 +101,7 @@ def build_pages(bot: commands.Bot) -> list[Page]:
                 "⚡  Quick jump",
                 f"`{p}help general` · `{p}help utility` · `{p}help fun`\n"
                 f"`{p}help economy` · `{p}help casino` · `{p}help mod`\n"
-                f"`{p}help setup` · `{p}help owner`",
+                f"`{p}help roles` · `{p}help snipe` · `{p}help setup` · `{p}help owner`",
             ),
             (
                 "🔖  Reading the pages",
@@ -266,7 +273,7 @@ def build_pages(bot: commands.Bot) -> list[Page]:
         emoji="⛓️",
         title="Moderation",
         blurb=(
-            "> Staff only, tiered by role.\n"
+            "> Staff only, tiered by role. Server-only — none of it works in DMs.\n"
             "> 🔴 **Mod or owner** · 🟡 **Trial Mod and above**\n"
             f"> `{p}modinfo` shows the live breakdown for this server."
         ),
@@ -277,11 +284,12 @@ def build_pages(bot: commands.Bot) -> list[Page]:
                 f"`{p}kick <@user> [reason]` {DIV} remove a member — they can rejoin\n"
                 f"`{p}ban <@user> [reason]` {DIV} permanent ban\n"
                 f"`{p}unban <user_id>` {DIV} lift a ban by Discord ID\n"
-                f"`{p}softban <@user> [reason]` {DIV} ban + instant unban, clears recent messages",
+                f"`{p}softban <@user> [reason]` {DIV} ban + instant unban, clears their last day of messages",
             ),
             (
                 "🟡  Timeouts & warnings",
                 f"`{p}timeout <@user> <minutes> [reason]` {DIV} mute. Alias: `{p}mute`\n"
+                f"┗ *Max **28 days** (40,320 minutes).*\n"
                 f"`{p}removetimeout <@user>` {DIV} lift it. Aliases: `{p}unmute` `{p}untimeout`\n"
                 f"`{p}warn <@user> [reason]` {DIV} issue a warning\n"
                 f"`{p}warnings <@user>` {DIV} view history. Aliases: `{p}warns` `{p}infractions`\n"
@@ -290,35 +298,150 @@ def build_pages(bot: commands.Bot) -> list[Page]:
             ),
             (
                 "🟡  Channels & cleanup",
-                f"`{p}clear <amount>` {DIV} bulk delete. Alias: `{p}purge` — **prefix only**\n"
+                f"`{p}clear <amount>` {DIV} bulk delete **1–100**. Alias: `{p}purge` — **prefix only**\n"
                 f"┣ `{p}clear bots` · `{p}clear user @user` · `{p}clear contains <word>`\n"
-                f"`{p}lock [#channel]` · `{p}unlock [#channel]` {DIV} close or reopen a channel\n"
+                f"┣ *The filtered forms scan the last 100 messages and delete up to 50 matches.*\n"
+                f"┗ *Your command message is removed too. Cleared messages stay "
+                f"snipeable, tagged as purged.*\n"
+                f"`{p}lock [#channel]` · `{p}unlock [#channel]` {DIV} stop or allow @everyone sending messages\n"
                 f"`{p}slowmode <seconds> [#channel]` {DIV} `0` disables it\n"
-                f"`{p}snipe` {DIV} last deleted message here. Alias: `{p}s`\n"
-                f"`{p}editsnipe` {DIV} last edited message here. Alias: `{p}es`",
+                f"`{p}snipe` · `{p}editsnipe` {DIV} deleted / edited message browser — see the **Snipe** page",
             ),
             (
                 "🟡  Member & server info",
-                f"`{p}nick <@user> [nickname]` {DIV} set or reset a nickname\n"
-                f"`{p}userinfo [@user]` {DIV} full profile. Aliases: `{p}ui` `{p}whois`\n"
-                f"`{p}serverinfo` {DIV} server stats. Aliases: `{p}si` `{p}server`\n"
-                f"`{p}modinfo` {DIV} what each staff tier can do",
+                f"`{p}nick <@user> [nickname]` {DIV} set a nickname, or omit it to reset\n"
+                f"`{p}userinfo [@user]` {DIV} ID, bot flag, account age, join date, roles "
+                f"(first 10) and warning count. Aliases: `{p}ui` `{p}whois`\n"
+                f"`{p}serverinfo` {DIV} ID, owner, member / channel / role / emoji counts, "
+                f"creation date. Aliases: `{p}si` `{p}server`\n"
+                f"`{p}modinfo` {DIV} what each staff tier can do, with the live role mentions",
             ),
             (
-                "🟡  Roles",
+                "🔑  How access works",
+                "The two staff roles come from `MOD_ROLE_ID` and `TRIAL_MOD_ROLE_ID` in `.env`. "
+                "Bot owners pass every check. Until those IDs are set, **only owners** can use "
+                "anything on the Moderation, Roles and Snipe pages. "
+                "Without the right role, Rosarium tells you which tier the command needs.",
+            ),
+            (
+                "🥀  Looking for roles?",
+                f"`{p}newrole` · `{p}arole` · `{p}remrole` · `{p}rolepurge` · `{p}rolelist` · "
+                f"`{p}massrole` {DIV} see the **Roles** page (`{p}help roles`)",
+            ),
+        ],
+    )
+
+    roles = Page(
+        key="roles",
+        label="Roles",
+        emoji="🥀",
+        title="Role Management",
+        blurb=(
+            "> Create, rename, move, hand out and strip roles.\n"
+            "> 🟡 **Trial Mod and above** · 🔴 **Mod or owner** for `massrole`"
+        ),
+        color=WINE,
+        fields=[
+            (
+                "🟡  Create & edit",
                 f"`{p}newrole <name>` {DIV} create a role\n"
                 f"`{p}role setposition <@role> <position>` {DIV} move it in the hierarchy\n"
+                f"┗ *Position starts at 1 and can't exceed the server's role count. "
+                f"A bare `{p}role` shows the usage.*\n"
                 f"`{p}rolename ch <@role> <new name>` {DIV} rename it\n"
-                f"`{p}arole <@role> <@user>` · `{p}remrole <@role> <@user>` {DIV} give or take\n"
-                f"`{p}rolepurge <@user>` {DIV} strip every removable role\n"
-                f"`{p}rolelist` {DIV} paginated list of all server roles",
+                f"┗ *The literal `ch` is required before the role.*",
+            ),
+            (
+                "🟡  Give & take",
+                f"`{p}arole <@role> <@user>` {DIV} give a role\n"
+                f"`{p}remrole <@role> <@user>` {DIV} take a role away\n"
+                f"┗ *Both tell you if the member already has it, or never had it.*\n"
+                f"`{p}rolepurge <@user>` {DIV} strip every removable role at once\n"
+                f"┗ *Skips `@everyone` and roles managed by integrations or bots.*",
+            ),
+            (
+                "🟡  Role list",
+                f"`{p}rolelist` {DIV} every role, highest first — position, member count and hex color\n"
+                f"┣ 15 roles per page, flipped with ◀️ ▶️ reactions, ❌ closes it\n"
+                f"┗ *Only the person who ran it can flip pages, and the controls go idle after 60 seconds.*",
             ),
             (
                 "🔴  Mass roles",
                 f"`{p}massrole <@role> [@role …]` {DIV} give role(s) to every member — **prefix only**\n"
-                f"┣ Asks for confirmation first and skips anyone who already has them\n"
-                f"┗ *Refuses `@everyone`, managed roles, roles above Rosarium or you, "
-                f"and roles with dangerous permissions.*",
+                f"┣ Shows how many members would change and asks for confirmation first\n"
+                f"┣ Skips anyone who already has the roles, posts progress every 25 members, "
+                f"and reports any failures at the end\n"
+                f"┣ One run at a time per server · Rosarium needs **Manage Roles**\n"
+                f"┗ *Refuses `@everyone`, managed roles, roles at or above Rosarium's top role "
+                f"(or yours, unless you're the server owner or a bot owner), and any role carrying "
+                f"Administrator, Manage Server / Roles / Channels, Kick, Ban, Timeout Members "
+                f"or Mention Everyone.*",
+            ),
+        ],
+    )
+
+    snipe = Page(
+        key="snipe",
+        label="Snipe",
+        emoji="🔎",
+        title="Snipe & Editsnipe",
+        blurb=(
+            "> A staff investigation tool — 🟡 **Trial Mod and above**.\n"
+            "> Remembers up to **100** deleted and **100** edited messages per channel for **24 hours**, "
+            "so deleting a pile of messages can't bury the evidence."
+        ),
+        color=IRON,
+        fields=[
+            (
+                "🔎  Commands",
+                f"`{p}snipe [query]` {DIV} browse **deleted** messages. Alias: `{p}s`\n"
+                f"`{p}editsnipe [query]` {DIV} browse **edited** messages (old and new text). Alias: `{p}es`\n"
+                f"┗ *Both work as slash commands too. Everything after the command is a mix of the options below.*",
+            ),
+            (
+                "🎯  Pick a message",
+                f"`{p}s` {DIV} the latest\n"
+                f"`{p}s 3` {DIV} the 3rd most recent — `#N` in any result means `{p}s N`\n"
+                f"`{p}s 2-6` {DIV} a range, shown as a list\n"
+                f"`{p}s 15m` {DIV} only the last 15 minutes. Units: `s` `m` `h` `d`",
+            ),
+            (
+                "🧰  Filters — stackable",
+                f"`contains <word>` {DIV} text or filename search — **put it last**, it takes the rest of the line\n"
+                f"`user <@user|id>` {DIV} everything one person deleted or edited\n"
+                f"`files` {DIV} only messages with attachments *(snipe only)*\n"
+                f"`purged` {DIV} only messages removed by `{p}clear` *(snipe only)*\n"
+                f"`in <#channel>` {DIV} another channel · `all` {DIV} every channel you can see",
+            ),
+            (
+                "🛠️  Tools",
+                f"`{p}s list` {DIV} compact log instead of one-at-a-time\n"
+                f"`{p}s top` {DIV} who deletes / edits the most — flags rapid-fire bursts "
+                f"(5 within 2 minutes)\n"
+                f"`{p}s export` {DIV} results as a `.txt` file — DM'd to you from the prefix form, "
+                f"private from the slash form\n"
+                f"`{p}s clear` {DIV} forget the matching entries — 🔴 **Mod or owner**, asks first\n"
+                f"`{p}s help` {DIV} the syntax cheat-sheet",
+            ),
+            (
+                "📖  The browser",
+                "Results open with ⏮️ ◀️ **Newer** · ▶️ **Older** ⏭️ buttons and a 📋 **List** / "
+                "🔍 **Detail** toggle; ✖️ closes it. Only the person who ran the command can use "
+                "the buttons, and they go idle after 2 minutes.\n"
+                "Attachments, stickers and the message being replied to are kept with each entry.",
+            ),
+            (
+                "🔒  Privacy",
+                "You only ever see channels **you** can view yourself. Bot messages aren't "
+                f"recorded, and neither are `{p}confess` or `{p}clear` invocations — so "
+                "anonymous confessions can't be unmasked. Everything is in-memory; a restart wipes it.",
+            ),
+            (
+                "💡  Examples",
+                f"`{p}s user @troll files last 1h`\n"
+                f"`{p}s all contains discord.gg`\n"
+                f"`{p}s in #general 5`\n"
+                f"`{p}es top`",
             ),
         ],
     )
@@ -405,7 +528,7 @@ def build_pages(bot: commands.Bot) -> list[Page]:
         ],
     )
 
-    return [index, general, utility, fun, economy, casino, moderation, setup, owner]
+    return [index, general, utility, fun, economy, casino, moderation, roles, snipe, setup, owner]
 
 
 # Accepted arguments for `.help <section>` → page key.
@@ -426,6 +549,21 @@ CATEGORY_ALIASES = {
     "moderation": "moderation",
     "mod": "moderation",
     "staff": "moderation",
+    "warn": "moderation",
+    "warnings": "moderation",
+    "ban": "moderation",
+    "kick": "moderation",
+    "timeout": "moderation",
+    "clear": "moderation",
+    "purge": "moderation",
+    "roles": "roles",
+    "role": "roles",
+    "massrole": "roles",
+    "rolelist": "roles",
+    "snipe": "snipe",
+    "editsnipe": "snipe",
+    "s": "snipe",
+    "es": "snipe",
     "setup": "setup",
     "server": "setup",
     "config": "setup",
