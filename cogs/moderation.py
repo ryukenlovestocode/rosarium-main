@@ -1,5 +1,5 @@
 """
-Moderation cog — kick/ban/timeout, warnings, bulk-delete, channel
+ultra fast bot Moderation cog — kick/ban/timeout, warnings, bulk-delete, channel
 lock/slowmode, role management, and a mod-only snipe/editsnipe pair.
 
 Ported from another bot into Rosarium's house style:
