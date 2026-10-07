@@ -773,6 +773,296 @@ class _ConfirmView(discord.ui.View):
         self.stop()
 
 
+# ---------- ROLE CREATION ----------
+
+ROLE_BATCH_MAX = 20          # most roles one submission may create
+ROLE_NAME_MAX = 100          # Discord's limit for a role name
+GUILD_ROLE_CAP = 250         # Discord's per-server role limit (incl. @everyone)
+
+_HEX_COLOR_RE = re.compile(r"^(?:#|0x)([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$")
+_ROLE_SPLIT_RE = re.compile(r"[\n;]+")
+_ROLE_SEPARATORS = {"-", "|", ":", ",", "="}
+
+
+class RoleSpecError(Exception):
+    """A problem with what the moderator typed into the form — shown to them."""
+
+
+@dataclass
+class RoleSpec:
+    name: str
+    color: discord.Colour
+
+
+def _safe(text: str, limit: int = 40) -> str:
+    return discord.utils.escape_markdown(discord.utils.escape_mentions(_clip(text, limit)))
+
+
+def _fmt_color(color: discord.Colour) -> str:
+    return "no color" if color.value == 0 else f"#{color.value:06X}"
+
+
+def _parse_hex_color(token: str) -> Optional[discord.Colour]:
+    """`#f00`, `#ff0000` or `0xff0000` -> Colour, else None."""
+    m = _HEX_COLOR_RE.match((token or "").strip())
+    if not m:
+        return None
+    digits = m.group(1)
+    if len(digits) == 3:
+        digits = "".join(c * 2 for c in digits)
+    return discord.Colour(int(digits, 16))
+
+
+def _parse_default_color(raw: str) -> Optional[discord.Colour]:
+    """The form's 'default color' box. The '#' is optional here (nothing to confuse it with)."""
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    if not raw.lower().startswith(("#", "0x")):
+        raw = "#" + raw
+    color = _parse_hex_color(raw)
+    if color is None:
+        raise RoleSpecError(f"`{_safe(raw, 20)}` isn't a valid default color — use `#RGB` or `#RRGGBB`.")
+    return color
+
+
+def _parse_role_options(raw: str) -> tuple[bool, bool]:
+    """The form's options box -> (hoist, mentionable)."""
+    words = {w for w in re.split(r"[\s,;]+", (raw or "").lower()) if w}
+    unknown = words - {"hoist", "mentionable"}
+    if unknown:
+        raise RoleSpecError(
+            f"Unknown option(s): {', '.join(f'`{_safe(w, 20)}`' for w in sorted(unknown))}. "
+            "Valid options are `hoist` and `mentionable`."
+        )
+    return "hoist" in words, "mentionable" in words
+
+
+def _parse_role_specs(raw: str, default: Optional[discord.Colour] = None) -> tuple[list, list]:
+    """
+    Turn the form text into (specs, problems).
+
+    One role per line (or separated by `;`):
+        Red Team #e74c3c
+        Blue Team #3498db
+        #2ecc71 Green Team        <- colour first works too
+        Guests                    <- no colour: uses the default colour, or none
+
+    Bad lines are skipped and reported; good lines are still created.
+    """
+    specs: list[RoleSpec] = []
+    problems: list[str] = []
+    seen: set[str] = set()
+
+    segments = [s.strip() for s in _ROLE_SPLIT_RE.split(raw or "")]
+    for n, seg in enumerate((s for s in segments if s), 1):
+        tokens = seg.split()
+        color: Optional[discord.Colour] = None
+
+        if len(tokens) == 1:
+            if _parse_hex_color(tokens[0]) is not None:
+                problems.append(f"Entry {n}: `{_safe(seg, 20)}` is a color with no role name.")
+                continue
+        else:
+            first, last = tokens[0], tokens[-1]
+            if (c := _parse_hex_color(last)) is not None:
+                color, tokens = c, tokens[:-1]
+                if tokens and tokens[-1] in _ROLE_SEPARATORS:
+                    tokens.pop()
+            elif (c := _parse_hex_color(first)) is not None:
+                color, tokens = c, tokens[1:]
+                if tokens and tokens[0] in _ROLE_SEPARATORS:
+                    tokens.pop(0)
+            elif last.startswith("#"):
+                problems.append(
+                    f"Entry {n}: `{_safe(last, 20)}` isn't a valid color — use `#RGB` or `#RRGGBB`."
+                )
+                continue
+            elif first.startswith("#"):
+                problems.append(
+                    f"Entry {n}: `{_safe(first, 20)}` isn't a valid color — use `#RGB` or `#RRGGBB`."
+                )
+                continue
+
+        name = " ".join(tokens).strip()
+        if not name:
+            problems.append(f"Entry {n}: no role name.")
+            continue
+        if len(name) > ROLE_NAME_MAX:
+            problems.append(f"Entry {n}: `{_safe(name, 30)}…` is longer than {ROLE_NAME_MAX} characters.")
+            continue
+        key = name.casefold()
+        if key in seen:
+            problems.append(f"Entry {n}: `{_safe(name)}` is listed twice — kept the first one.")
+            continue
+        seen.add(key)
+
+        if color is None:
+            color = default if default is not None else discord.Colour.default()
+        specs.append(RoleSpec(name=name, color=color))
+
+    return specs, problems
+
+
+def _role_preflight(guild: discord.Guild, count: int) -> Optional[str]:
+    """Return an error message if creating `count` roles can't work, else None."""
+    if not guild.me.guild_permissions.manage_roles:
+        return "I need the **Manage Roles** permission to create roles."
+    if count > ROLE_BATCH_MAX:
+        return f"That's **{count}** roles — the limit is **{ROLE_BATCH_MAX}** per go. Split it into smaller batches."
+    if len(guild.roles) + count > GUILD_ROLE_CAP:
+        room = max(0, GUILD_ROLE_CAP - len(guild.roles))
+        return f"This server only has room for **{room}** more role(s) (Discord's limit is {GUILD_ROLE_CAP})."
+    return None
+
+
+def _problems_message(problems: list) -> str:
+    if not problems:
+        return "I didn't find any roles to create — give me at least one name, e.g. `Red Team #e74c3c`."
+    return "I couldn't read any roles from that:\n" + "\n".join(f"• {p}" for p in problems[:10])
+
+
+async def _create_role_batch(
+    guild: discord.Guild,
+    actor: discord.abc.User,
+    specs: list,
+    problems: list,
+    *,
+    hoist: bool = False,
+    mentionable: bool = False,
+) -> discord.Embed:
+    """Create every spec in order and return one summary embed."""
+    reason = f"Created by {actor}"
+    created: list[discord.Role] = []
+    failed: list[str] = []
+
+    for idx, spec in enumerate(specs):
+        try:
+            role = await guild.create_role(
+                name=spec.name,
+                colour=spec.color,
+                hoist=hoist,
+                mentionable=mentionable,
+                reason=reason,
+            )
+        except discord.Forbidden:
+            # Missing permission won't fix itself mid-batch — report the rest and stop.
+            failed.extend(f"`{_safe(s.name)}` — missing permissions" for s in specs[idx:])
+            break
+        except discord.HTTPException as exc:
+            failed.append(f"`{_safe(spec.name)}` — {_clip(exc.text or 'Discord rejected it', 80)}")
+        else:
+            created.append(role)
+
+    fields: list[tuple] = []
+    if created:
+        lines = [f"{r.mention} · `{_fmt_color(r.colour)}`" for r in created]
+        fields.append((f"Created ({len(created)})", _clip("\n".join(lines), 1000)))
+        extras = [label for label, on in (("Hoisted", hoist), ("Mentionable", mentionable)) if on]
+        if extras:
+            fields.append(("Options", ", ".join(extras)))
+    if failed:
+        fields.append((f"Failed ({len(failed)})", _clip("\n".join(failed), 1000)))
+    if problems:
+        fields.append((f"Skipped ({len(problems)})", _clip("\n".join(problems), 1000)))
+    fields.append(("Moderator", actor.mention))
+
+    if not created:
+        title, color = "Role Creation Failed", config.EMBED_COLOR
+    else:
+        title, color = ("Role Created" if len(created) == 1 else "Roles Created"), config.EMBED_COLOR_DARK
+    return _mod_embed(title, color, fields)
+
+
+class RoleCreateModal(discord.ui.Modal, title="Create Roles"):
+    """One paragraph box, one role per line: `Name #hex`."""
+
+    roles_input = discord.ui.TextInput(
+        label="Roles — one per line: Name #hex",
+        style=discord.TextStyle.paragraph,
+        placeholder="Red Team #e74c3c\nBlue Team #3498db\nGuests",
+        required=True,
+        max_length=2000,
+    )
+    default_color = discord.ui.TextInput(
+        label="Default color (optional)",
+        placeholder="Used for lines without a hex code, e.g. #9b59b6",
+        required=False,
+        max_length=8,
+    )
+    options = discord.ui.TextInput(
+        label="Options (optional): hoist, mentionable",
+        placeholder="hoist = show separately in the member list",
+        required=False,
+        max_length=40,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        none = discord.AllowedMentions.none()
+        guild = interaction.guild
+        if guild is None:
+            return await interaction.response.send_message("This only works inside a server.", ephemeral=True)
+
+        # Validate everything before deferring so errors can stay private (ephemeral).
+        try:
+            default = _parse_default_color(self.default_color.value)
+            hoist, mentionable = _parse_role_options(self.options.value)
+        except RoleSpecError as exc:
+            return await interaction.response.send_message(str(exc), ephemeral=True, allowed_mentions=none)
+
+        specs, problems = _parse_role_specs(self.roles_input.value, default)
+        if not specs:
+            return await interaction.response.send_message(
+                _problems_message(problems), ephemeral=True, allowed_mentions=none
+            )
+
+        error = _role_preflight(guild, len(specs))
+        if error:
+            return await interaction.response.send_message(error, ephemeral=True)
+
+        await interaction.response.defer(thinking=True)   # creating many roles can exceed 3s
+        embed = await _create_role_batch(
+            guild, interaction.user, specs, problems, hoist=hoist, mentionable=mentionable
+        )
+        await interaction.followup.send(embed=embed)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        msg = "Something went wrong while creating those roles."
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+        await super().on_error(interaction, error)   # keep the traceback in the logs
+
+
+class RoleCreatePromptView(discord.ui.View):
+    """Prefix invocations can't open a modal directly, so they get this button."""
+
+    def __init__(self, author_id: int):
+        super().__init__(timeout=120)
+        self.author_id = author_id
+        self.message: Optional[discord.Message] = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("This prompt isn't for you.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Open role form", emoji="🎨", style=discord.ButtonStyle.primary)
+    async def open_form(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(RoleCreateModal())
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+
+
 # ---------- COG ----------
 
 
@@ -1484,7 +1774,7 @@ class Moderation(commands.Cog):
                 f"`{prefix}snipe / {prefix}s` — Browse deleted messages (`{prefix}s help`)\n"
                 f"`{prefix}editsnipe / {prefix}es` — Browse edited messages\n"
                 f"`{prefix}modinfo` — Show this panel\n"
-                f"`{prefix}newrole` — Create a new role\n"
+                f"`{prefix}newrole` — Create one or more roles (form with hex colors)\n"
                 f"`{prefix}role setposition` — Set a role's position\n"
                 f"`{prefix}rolename ch` — Rename a role\n"
                 f"`{prefix}arole` — Assign a role to a user\n"
@@ -1502,23 +1792,39 @@ class Moderation(commands.Cog):
     # ══════════════════════════════════════════
 
     # ---------- NEWROLE ----------
+    # Slash: opens the form straight away. Prefix: posts a button that opens it
+    # (Discord only allows modals as the answer to an interaction).
+    # Shortcut: `$newrole Red Team #e74c3c; Blue Team #3498db` skips the form,
+    # and `$newrole Moderators` still works exactly like it used to.
 
-    @commands.hybrid_command(description="Create a new role.")
+    @commands.hybrid_command(
+        aliases=["newroles"],
+        description="Create one or more roles with hex colors — opens a form.",
+    )
+    @app_commands.describe(roles="Optional shortcut: `Name #hex; Name #hex`. Leave empty to open the form.")
     @has_any_mod_role()
-    async def newrole(self, ctx: commands.Context, *, name: str):
-        if not name:
-            return await ctx.send(f"Usage: `{config.COMMAND_PREFIX}newrole <name>`", ephemeral=True)
+    async def newrole(self, ctx: commands.Context, *, roles: str = None):
+        if roles and roles.strip():
+            specs, problems = _parse_role_specs(roles)
+            if not specs:
+                return await ctx.send(
+                    _problems_message(problems), ephemeral=True, allowed_mentions=discord.AllowedMentions.none()
+                )
+            error = _role_preflight(ctx.guild, len(specs))
+            if error:
+                return await ctx.send(error, ephemeral=True)
+            await ctx.defer()
+            embed = await _create_role_batch(ctx.guild, ctx.author, specs, problems)
+            return await ctx.send(embed=embed)
 
-        role = await ctx.guild.create_role(name=name, reason=f"Created by {ctx.author}")
-        await ctx.send(embed=_mod_embed(
-            "Role Created",
-            config.EMBED_COLOR_DARK,
-            [
-                ("Role", role.mention),
-                ("Name", role.name),
-                ("Moderator", ctx.author.mention),
-            ]
-        ))
+        if ctx.interaction is not None:
+            return await ctx.interaction.response.send_modal(RoleCreateModal())
+
+        view = RoleCreatePromptView(ctx.author.id)
+        view.message = await ctx.send(
+            "Press the button to open the role form — one role per line, like `Red Team #e74c3c`.",
+            view=view,
+        )
 
     # ---------- ROLE SETPOSITION ----------
 
