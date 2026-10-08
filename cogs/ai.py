@@ -21,7 +21,7 @@ log = logging.getLogger("rosarium.ai_chat")
 
 # ---------- CONFIG ----------
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-MODEL = "llama-3.3-70b-versatile"
+MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 COOLDOWN = 10        # seconds per user
 DAILY_LIMIT = 10     # AI replies per user per day (UTC)
 HISTORY_LIMIT = 8    # recent messages fed in as context
@@ -191,13 +191,17 @@ class AIChat(commands.Cog):
             {"role": "user", "content": f"{message.author.display_name} says: {message.content}"}
         )
 
+        # gpt-oss is a reasoning model: keep thinking short and leave token headroom
+        extra = {"reasoning_effort": "low"} if "gpt-oss" in MODEL else {}
+
         try:
             async with message.channel.typing():
                 response = await self.client.chat.completions.create(
                     model=MODEL,
                     messages=[{"role": "system", "content": system}, *context],
-                    max_tokens=150,
+                    max_completion_tokens=400,
                     temperature=0.85,
+                    **extra,
                 )
             reply = (response.choices[0].message.content or "").strip() or "..."
         except Exception:
