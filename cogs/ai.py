@@ -29,8 +29,8 @@ HISTORY_LIMIT = 8    # recent messages fed in as context
 BOT_NAME = "Roselle"
 NAME_PATTERN = re.compile(r"\broselle\b", re.IGNORECASE)  # add |rosarium if you want both
 
-OWNER_ID = 1099923662267760745       # Ryuken
-CO_OWNER_ID = 948613491999264838     # Aizen
+OWNER_ID = 1504961534659530812      # Ryuken
+CO_OWNER_ID = 948613491999264838    # Aizen
 LOVED_IDS = {OWNER_ID, CO_OWNER_ID}
 ADMIN_IDS = LOVED_IDS | set(config.OWNER_IDS)
 
