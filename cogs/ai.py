@@ -7,6 +7,7 @@ Admin controls live under the `ai` command group.
 
 import logging
 import os
+import random
 import re
 import time
 from datetime import datetime, timezone
@@ -25,6 +26,17 @@ MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 COOLDOWN = 10        # seconds per user
 DAILY_LIMIT = 10     # AI replies per user per day (UTC)
 HISTORY_LIMIT = 8    # recent messages fed in as context
+
+COOLDOWN_QUIPS = [
+    "hold on, i'm still thinking about what you just said",
+    "one thing at a time, i only have so many brain cells 💀",
+    "you type faster than i can think, give me a sec",
+    "ok ok i heard you, let me catch up",
+    "my brain is buffering, hold that thought 😭",
+    "patience, i'm not a vending machine 🙄",
+    "hang on, i'm mid-thought and you're being rude 👀",
+    "woah slow down, i'm still on your last message",
+]
 
 BOT_NAME = "Roselle"
 NAME_PATTERN = re.compile(r"\broselle\b", re.IGNORECASE)  # add |rosarium if you want both
@@ -110,6 +122,7 @@ class AIChat(commands.Cog):
             log.warning("GROQ_API_KEY not set; AI chat replies are disabled.")
 
         self.last_trigger: dict[int, float] = {}
+        self.last_quip: dict[int, float] = {}
         self.daily_counts: dict[int, dict] = {}   # user_id -> {count, date}
         self.disabled_guilds: set[int] = set()
         self.disabled_channels: set[int] = set()
@@ -143,6 +156,10 @@ class AIChat(commands.Cog):
         now = time.time()
 
         if now - self.last_trigger.get(user_id, 0) < COOLDOWN:
+            # Reply with a quip, but at most once per cooldown window
+            if now - self.last_quip.get(user_id, 0) >= COOLDOWN:
+                self.last_quip[user_id] = now
+                await message.reply(random.choice(COOLDOWN_QUIPS), mention_author=False)
             return
         self.last_trigger[user_id] = now
 
