@@ -88,6 +88,7 @@ def build_pages(bot: commands.Bot) -> list[Page]:
                 "🌿  Sections",
                 f"🕊️ **General** {DIV} ping, about, this menu\n"
                 f"🕯️ **Utility** {DIV} actions, afk, avatars, quote cards\n"
+                f"🕘 **Timezone** {DIV} set your timezone, convert times, event timestamps\n"
                 f"💞 **Fun** {DIV} marriage, ship, confessions, counting\n"
                 f"🌹 **Economy** {DIV} petals, daily, pay, leaderboard\n"
                 f"🎲 **Casino** {DIV} coinflip, dice, wheel, fish, slots, blackjack, rob\n"
@@ -99,7 +100,7 @@ def build_pages(bot: commands.Bot) -> list[Page]:
             ),
             (
                 "⚡  Quick jump",
-                f"`{p}help general` · `{p}help utility` · `{p}help fun`\n"
+                f"`{p}help general` · `{p}help utility` · `{p}help timezone` · `{p}help fun`\n"
                 f"`{p}help economy` · `{p}help casino` · `{p}help mod`\n"
                 f"`{p}help roles` · `{p}help snipe` · `{p}help setup` · `{p}help owner`",
             ),
@@ -164,6 +165,49 @@ def build_pages(bot: commands.Bot) -> list[Page]:
                 f"┣ `{p}quote @user <text>` — quote someone else\n"
                 f"┣ *(reply to a message)* + `{p}quote` — quote that message\n"
                 f"┗ *Posts to the quote channel · 15s cooldown*",
+            ),
+        ],
+    )
+
+    timezone = Page(
+        key="timezone",
+        label="Timezone",
+        emoji="🕘",
+        title="Timezones",
+        blurb=(
+            "> Tell Rosarium your timezone once and it does the maths — daylight saving included.\n"
+            "> Open to **everyone** · every command also works as a **slash command**."
+        ),
+        color=BLUSH,
+        fields=[
+            (
+                "🌍  Your timezone",
+                f"`{p}timezone set <place>` {DIV} save it. Search by city or country: "
+                f"`India`, `Kolkata`, `New York`, `Asia/Tokyo`. Alias: `{p}tz`\n"
+                f"┗ *The slash form suggests matches as you type.*\n"
+                f"`{p}timezone view [@user]` {DIV} a saved timezone, with the local time and date\n"
+                f"`{p}timezone remove` {DIV} delete yours *(asks first)*",
+            ),
+            (
+                "👥  The server",
+                f"`{p}timezone list` {DIV} who lives in which timezone\n"
+                f"`{p}timezone status` {DIV} what time it is for everyone, split into "
+                f"🟢 likely awake and 🌙 likely sleeping\n"
+                f"┗ *Only members who set a timezone appear. \"Awake\" is a rough 07:00–23:00 guess.*",
+            ),
+            (
+                "🕰️  Time & conversion",
+                f"`{p}timein [@user]` {DIV} what time it is for someone right now\n"
+                f"`{p}time [@user] [time]` {DIV} convert a time to the server's timezones\n"
+                f"┣ `{p}time 8pm` · `{p}time @rose 20:00` · `{p}time tomorrow 9:30am`\n"
+                f"┗ `{p}time 9am in Tokyo` — read the time in any place you name\n"
+                f"`{p}timefix <text>` {DIV} turn *\"Meeting tomorrow at 8pm\"* into a "
+                f"timestamp that shows in **everyone's own** timezone",
+            ),
+            (
+                "💡  Good to know",
+                "Timezones are saved permanently and follow daylight saving on their own. "
+                "`timefix` and `time` read times in *your* timezone, so set it first.",
             ),
         ],
     )
@@ -528,7 +572,7 @@ def build_pages(bot: commands.Bot) -> list[Page]:
         ],
     )
 
-    return [index, general, utility, fun, economy, casino, moderation, roles, snipe, setup, owner]
+    return [index, general, utility, timezone, fun, economy, casino, moderation, roles, snipe, setup, owner]
 
 
 # Accepted arguments for `.help <section>` → page key.
@@ -537,6 +581,12 @@ CATEGORY_ALIASES = {
     "utility": "utility",
     "util": "utility",
     "actions": "utility",
+    "timezone": "timezone",
+    "timezones": "timezone",
+    "tz": "timezone",
+    "time": "timezone",
+    "timein": "timezone",
+    "timefix": "timezone",
     "fun": "fun",
     "social": "fun",
     "economy": "economy",
