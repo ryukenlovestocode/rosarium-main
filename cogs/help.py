@@ -315,6 +315,8 @@ def build_pages(bot: commands.Bot) -> list[Page]:
                 "🔴  Word lists · Mod role, administrators or owner",
                 f"`{p}rep addgood <word>` {DIV} a word that earns reputation\n"
                 f"`{p}rep addbad <word>` {DIV} a word that costs reputation\n"
+                f"`{p}rep addgood mass` · `{p}rep addbad mass` {DIV} open a form and paste many words at once "
+                f"— one per line or comma-separated\n"
                 f"`{p}rep removegood <word>` · `{p}rep removebad <word>` {DIV} take one off a list\n"
                 f"`{p}rep words` {DIV} show both lists\n"
                 f"┣ Phrases work (`{p}rep addgood thank you`). Matching is whole-word and ignores case\n"

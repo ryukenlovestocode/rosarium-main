@@ -25,7 +25,9 @@ Commands (prefix `$` or slash):
   reputation check [member]      — same as above
   reputation leaderboard         — aliases: lb, top. Top 10 by reputation
   reputation addgood <word>      — [mod] add a word that earns reputation
+  reputation addgood mass        — [mod] open a form to add many good words at once
   reputation addbad <word>       — [mod] add a word that costs reputation
+  reputation addbad mass         — [mod] open a form to add many bad words at once
   reputation removegood <word>   — [mod] remove a good word
   reputation removebad <word>    — [mod] remove a bad word
   reputation words               — [mod] show both lists
@@ -139,20 +141,128 @@ def _normalize_word(raw: str) -> str | None:
     return word
 
 
-def _fmt_words(words: list[str], spoiler: bool) -> str:
-    """Format a word list for an embed field (max 1024 chars)."""
+def _fmt_words(words: list[str], spoiler: bool, limit: int = 1000) -> str:
+    """Format a word list for an embed field / message (stays under `limit` chars)."""
     if not words:
         return "*None yet.*"
     items = [f"||{w}||" if spoiler else f"`{w}`" for w in sorted(words)]
     out: list[str] = []
     length = 0
     for i, item in enumerate(items):
-        if length + len(item) + 2 > 1000:
+        if length + len(item) + 2 > limit:
             out.append(f"…and {len(items) - i} more")
             break
         out.append(item)
         length += len(item) + 2
     return ", ".join(out)
+
+
+def _split_words(text: str) -> list[str]:
+    """Split pasted text on newlines and commas; drop blanks and duplicates, keep order."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for chunk in re.split(r"[\n,]+", text):
+        word = " ".join(chunk.lower().split())
+        if word and word not in seen:
+            seen.add(word)
+            out.append(word)
+    return out
+
+
+def _summarize_add(kind: str, added: list[str], skipped: dict[str, list[str]]) -> str:
+    """Result message for a (mass) add. Bad words are spoilered."""
+    other = "bad" if kind == "good" else "good"
+    spoiler = kind == "bad"
+    delta = GOOD_DELTA if kind == "good" else BAD_DELTA
+
+    lines = []
+    if added:
+        plural = "" if len(added) == 1 else "s"
+        lines.append(
+            f"✅ Added **{len(added)}** {kind} word{plural} ({delta:+d} reputation): "
+            f"{_fmt_words(added, spoiler, 300)}"
+        )
+    else:
+        lines.append("Nothing was added.")
+
+    reasons = [
+        ("already", "Already on the list"),
+        ("other", f"On the **{other}** list (remove it there first)"),
+        ("invalid", f"Wrong length ({MIN_WORD_LEN}–{MAX_WORD_LEN} characters)"),
+        ("full", f"List is full ({MAX_WORDS_PER_LIST} words max)"),
+    ]
+    for key, label in reasons:
+        if skipped[key]:
+            lines.append(f"⚠️ {label} — {len(skipped[key])}: {_fmt_words(skipped[key], spoiler, 250)}")
+    return "\n".join(lines)
+
+
+# ---------- MASS-ADD FORM ----------
+
+class MassWordsModal(discord.ui.Modal):
+    """Paste many words — one per line, or comma-separated — into one form."""
+
+    def __init__(self, cog: "Reputation", kind: str, source_message: discord.Message | None = None):
+        super().__init__(title=f"Add {kind} words", timeout=600)
+        self.cog = cog
+        self.kind = kind
+        self.source_message = source_message  # the "Open form" button message (prefix flow)
+        delta = GOOD_DELTA if kind == "good" else BAD_DELTA
+        self.words = discord.ui.TextInput(
+            label=f"{kind.capitalize()} words ({delta:+d} reputation)",
+            style=discord.TextStyle.paragraph,
+            placeholder="One per line, or separated by commas",
+            required=True,
+            max_length=4000,
+        )
+        self.add_item(self.words)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raws = _split_words(str(self.words.value))
+        if not raws:
+            return await interaction.response.send_message(
+                "No words found. Put one per line, or separate them with commas.", ephemeral=True
+            )
+        added, skipped = self.cog._add_many(self.kind, raws)
+        await interaction.response.send_message(_summarize_add(self.kind, added, skipped), ephemeral=True)
+        if self.source_message is not None:
+            try:
+                await self.source_message.delete()
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        log.error("Mass-add form failed", exc_info=error)
+        if not interaction.response.is_done():
+            await interaction.response.send_message("Something went wrong adding those words.", ephemeral=True)
+
+
+class OpenFormView(discord.ui.View):
+    """Prefix commands can't open a modal directly, so they post this button instead."""
+
+    def __init__(self, cog: "Reputation", kind: str, author_id: int):
+        super().__init__(timeout=120)
+        self.cog = cog
+        self.kind = kind
+        self.author_id = author_id
+        self.message: discord.Message | None = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("This form isn't yours.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Open word form", emoji="📝", style=discord.ButtonStyle.primary)
+    async def open_form(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(MassWordsModal(self.cog, self.kind, self.message))
+
+    async def on_timeout(self):
+        if self.message is not None:
+            try:
+                await self.message.delete()
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
 
 
 # ---------- COG ----------
@@ -333,34 +443,61 @@ class Reputation(commands.Cog):
             except (discord.Forbidden, discord.HTTPException):
                 pass
 
+    def _add_many(self, kind: str, raws: list[str]) -> tuple[list[str], dict[str, list[str]]]:
+        """Add words to a list with a single save. Returns (added, skipped-by-reason)."""
+        other = "bad" if kind == "good" else "good"
+        words = self._words()
+        added: list[str] = []
+        skipped: dict[str, list[str]] = {"invalid": [], "already": [], "other": [], "full": []}
+        for raw in raws:
+            word = _normalize_word(raw)
+            if word is None:
+                skipped["invalid"].append(" ".join(raw.split())[:MAX_WORD_LEN] or "(blank)")
+            elif word in words[other]:
+                skipped["other"].append(word)
+            elif word in words[kind]:
+                skipped["already"].append(word)
+            elif len(words[kind]) >= MAX_WORDS_PER_LIST:
+                skipped["full"].append(word)
+            else:
+                words[kind].append(word)
+                added.append(word)
+        if added:
+            self.store.set("words", words)
+            self._compile()
+        return added, skipped
+
     async def _add_word(self, ctx: commands.Context, kind: str, raw: str):
         await self._tidy(ctx)
-        word = _normalize_word(raw)
-        if word is None:
+        added, skipped = self._add_many(kind, [raw])
+
+        if added:
+            shown = f"||{added[0]}||" if kind == "bad" else f"**{added[0]}**"
+            delta = GOOD_DELTA if kind == "good" else BAD_DELTA
             return await ctx.send(
-                f"Words must be between {MIN_WORD_LEN} and {MAX_WORD_LEN} characters.", ephemeral=True
+                f"Added {shown} to the **{kind}** words ({delta:+d} reputation).", ephemeral=True
             )
 
         other = "bad" if kind == "good" else "good"
-        words = self._words()
-        if word in words[other]:
-            return await ctx.send(
-                f"That word is already on the **{other}** list. Remove it there first.", ephemeral=True
-            )
-        if word in words[kind]:
-            return await ctx.send(f"That word is already on the **{kind}** list.", ephemeral=True)
-        if len(words[kind]) >= MAX_WORDS_PER_LIST:
-            return await ctx.send(
-                f"The {kind} list is full ({MAX_WORDS_PER_LIST} words max).", ephemeral=True
-            )
+        if skipped["other"]:
+            msg = f"That word is already on the **{other}** list. Remove it there first."
+        elif skipped["already"]:
+            msg = f"That word is already on the **{kind}** list."
+        elif skipped["full"]:
+            msg = f"The {kind} list is full ({MAX_WORDS_PER_LIST} words max)."
+        else:
+            msg = f"Words must be between {MIN_WORD_LEN} and {MAX_WORD_LEN} characters."
+        await ctx.send(msg, ephemeral=True)
 
-        words[kind].append(word)
-        self.store.set("words", words)
-        self._compile()
-
-        shown = f"||{word}||" if kind == "bad" else f"**{word}**"
-        delta = GOOD_DELTA if kind == "good" else BAD_DELTA
-        await ctx.send(f"Added {shown} to the **{kind}** words ({delta:+d} reputation).", ephemeral=True)
+    async def _open_mass_form(self, ctx: commands.Context, kind: str):
+        if ctx.interaction is not None:
+            # Slash command: we can open the modal straight away.
+            return await ctx.interaction.response.send_modal(MassWordsModal(self, kind))
+        # Prefix command: a modal can only answer an interaction, so hand over a button.
+        view = OpenFormView(self, kind, ctx.author.id)
+        view.message = await ctx.send(
+            f"Press the button to add many **{kind}** words at once.", view=view
+        )
 
     async def _remove_word(self, ctx: commands.Context, kind: str, raw: str):
         await self._tidy(ctx)
@@ -376,15 +513,35 @@ class Reputation(commands.Cog):
         shown = f"||{word}||" if kind == "bad" else f"**{word}**"
         await ctx.send(f"Removed {shown} from the **{kind}** words.", ephemeral=True)
 
-    @reputation.command(name="addgood", description="[Mod] Add a word that earns reputation.")
+    @reputation.group(
+        name="addgood",
+        invoke_without_command=True,
+        fallback="word",
+        description="[Mod] Add a word that earns reputation.",
+    )
     @is_rep_manager()
     async def rep_addgood(self, ctx: commands.Context, *, word: str):
         await self._add_word(ctx, "good", word)
 
-    @reputation.command(name="addbad", description="[Mod] Add a word that costs reputation.")
+    @rep_addgood.command(name="mass", description="[Mod] Add many good words at once (opens a form).")
+    @is_rep_manager()
+    async def rep_addgood_mass(self, ctx: commands.Context):
+        await self._open_mass_form(ctx, "good")
+
+    @reputation.group(
+        name="addbad",
+        invoke_without_command=True,
+        fallback="word",
+        description="[Mod] Add a word that costs reputation.",
+    )
     @is_rep_manager()
     async def rep_addbad(self, ctx: commands.Context, *, word: str):
         await self._add_word(ctx, "bad", word)
+
+    @rep_addbad.command(name="mass", description="[Mod] Add many bad words at once (opens a form).")
+    @is_rep_manager()
+    async def rep_addbad_mass(self, ctx: commands.Context):
+        await self._open_mass_form(ctx, "bad")
 
     @reputation.command(name="removegood", description="[Mod] Remove a good word.")
     @is_rep_manager()
