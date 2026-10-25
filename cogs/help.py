@@ -320,8 +320,8 @@ def build_pages(bot: commands.Bot) -> list[Page]:
                 f"`{p}rep removegood <word>` · `{p}rep removebad <word>` {DIV} take one off a list\n"
                 f"`{p}rep words` {DIV} show both lists\n"
                 f"┣ Phrases work (`{p}rep addgood thank you`). Matching is whole-word and ignores case\n"
-                f"┗ *Use the slash forms (`/reputation addbad`) for bad words — replies are private, "
-                f"and prefix commands delete your message where they can.*",
+                f"┗ *Lists are hidden from members: replies are private (slash) or sent by DM (prefix). "
+                f"Typing a word in a prefix command shows it for a moment — prefer the slash forms or the mass form.*",
             ),
         ],
     )
