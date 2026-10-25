@@ -1,7 +1,8 @@
 """
 cogs/ai_chat.py: Groq-powered conversational replies for Rosarium.
 
-Triggers when someone says the bot's name or replies to one of its messages.
+Triggers when someone says the bot's name, replies to one of its messages,
+or @-tags it (she gets annoyed about that).
 Admin controls live under the `ai` command group.
 """
 
@@ -113,6 +114,15 @@ You are {BOT_NAME}, a sweet and sassy goth girl.
 {SHARED_RULES}
 """.strip()
 
+# Appended to the system prompt when someone @-tags the bot
+PING_ANGRY = """
+
+IMPORTANT: This person just pinged you with an @mention and you hate being pinged. Respond irritated and annoyed, snappy and a little dramatic, like they interrupted you. Still 1 sentence max, and still react to anything else they said."""
+
+PING_LOVED = """
+
+IMPORTANT: This person just pinged you with an @mention. Act mildly annoyed about being pinged, but you can't actually stay mad at him, so let some softness slip through."""
+
 
 # ---------- ADMIN CHECK ----------
 def ai_admin():
@@ -165,7 +175,12 @@ class AIChat(commands.Cog):
             entry["count"] += 1
 
     # ---------- CORE RESPONDER ----------
-    async def respond(self, message: discord.Message, replied: bool = False) -> None:
+    async def respond(
+        self,
+        message: discord.Message,
+        replied: bool = False,
+        pinged: bool = False,
+    ) -> None:
         user_id = message.author.id
         now = time.time()
 
@@ -200,6 +215,9 @@ class AIChat(commands.Cog):
                 "up based on context. If they're being negative about him, shut it down hard."
             )
 
+        if pinged:
+            system += PING_LOVED if user_id in LOVED_IDS else PING_ANGRY
+
         # Recent channel history for context (history() is newest-first)
         context: list[dict] = []
         try:
@@ -218,8 +236,9 @@ class AIChat(commands.Cog):
         except discord.HTTPException:
             pass
 
+        # clean_content turns <@id> into @Name so the model reads pings properly
         context.append(
-            {"role": "user", "content": f"{message.author.display_name} says: {message.content}"}
+            {"role": "user", "content": f"{message.author.display_name} says: {message.clean_content}"}
         )
 
         # gpt-oss is a reasoning model: keep thinking short and leave token headroom
@@ -308,8 +327,11 @@ class AIChat(commands.Cog):
 
         said_name = bool(NAME_PATTERN.search(message.content))
 
-        if replied_to_bot or said_name:
-            await self.respond(message, replied=replied_to_bot)
+        # Direct @tag of the bot (a reply's auto-ping doesn't count as a tag)
+        pinged = self.bot.user in message.mentions and not replied_to_bot
+
+        if replied_to_bot or said_name or pinged:
+            await self.respond(message, replied=replied_to_bot, pinged=pinged)
 
 
 async def setup(bot: commands.Bot):
