@@ -3,8 +3,8 @@ Help cog — the paginated command index for Rosarium.
 
 Rewritten from the Luna-era version:
   - Every page is built from the commands that actually exist in this
-    bot's cogs (general, utility, fun, economy, moderation, welcomer,
-    embed_builder, reaction_roles, autorole).
+    bot's cogs (general, utility, fun, economy, reputation, moderation,
+    welcomer, embed_builder, reaction_roles, autorole).
     Luna's AI / Statistics / Clans pages and her personality commands
     (fortune, cosmic, prophecy, 8ball, roast…) are gone, since nothing
     in this project implements them.
@@ -26,6 +26,9 @@ Moderation is split across three pages so each stays inside Discord's embed
 limits: Moderation (removals, timeouts, warnings, cleanup, info), Roles
 (role editing, mass roles, role list) and Snipe (the deleted/edited message
 browser and its query syntax). They mirror moderation.py one-to-one.
+
+The Reputation page mirrors cogs/reputation.py: the reputation commands, the
+$profile card, and the staff-managed good/bad word lists.
 
 The Server Setup page covers the slash-only configuration commands
 (/embed, /reactionrole, /autorole, /leavelog). Those are gated by Discord
@@ -91,6 +94,7 @@ def build_pages(bot: commands.Bot) -> list[Page]:
                 f"🕘 **Timezone** {DIV} set your timezone, convert times, event timestamps\n"
                 f"💞 **Fun** {DIV} marriage, ship, confessions, counting\n"
                 f"🌹 **Economy** {DIV} petals, daily, pay, leaderboard\n"
+                f"🌸 **Reputation** {DIV} standing, leaderboard, your profile card\n"
                 f"🎲 **Casino** {DIV} coinflip, dice, wheel, fish, slots, blackjack, rob\n"
                 f"⛓️ **Moderation** {DIV} kick, ban, timeouts, warnings, cleanup\n"
                 f"🥀 **Roles** {DIV} role editing, mass roles, role list\n"
@@ -101,7 +105,7 @@ def build_pages(bot: commands.Bot) -> list[Page]:
             (
                 "⚡  Quick jump",
                 f"`{p}help general` · `{p}help utility` · `{p}help timezone` · `{p}help fun`\n"
-                f"`{p}help economy` · `{p}help casino` · `{p}help mod`\n"
+                f"`{p}help economy` · `{p}help reputation` · `{p}help casino` · `{p}help mod`\n"
                 f"`{p}help roles` · `{p}help snipe` · `{p}help setup` · `{p}help owner`",
             ),
             (
@@ -265,11 +269,57 @@ def build_pages(bot: commands.Bot) -> list[Page]:
                 f"`{p}balance [@user]` {DIV} check a wallet. Aliases: `{p}bal` `{p}wallet` `{p}networth`\n"
                 f"`{p}daily` {DIV} claim **5,000–15,000 petals**, once every 24 hours\n"
                 f"`{p}pay <@user> <amount>` {DIV} transfer petals. Aliases: `{p}transfer` `{p}give`\n"
-                f"`{p}leaderboard` {DIV} the ten richest in the server. Aliases: `{p}lb` `{p}top` `{p}rich`",
+                f"`{p}leaderboard` {DIV} the ten richest in the server. Aliases: `{p}lb` `{p}top` `{p}rich`\n"
+                f"`{p}profile [@user]` {DIV} your petals alongside your reputation — see the **Reputation** page",
             ),
             (
                 "🔒  Owner",
-                f"`{p}addmoney <amount> [@user]` {DIV} grant petals, for testing",
+                f"`{p}addmoney <amount> [@user]` {DIV} grant petals, for testing\n"
+                f"`{p}burnmoney <amount> [@user]` {DIV} remove petals, for testing",
+            ),
+        ],
+    )
+
+    reputation = Page(
+        key="reputation",
+        label="Reputation",
+        emoji="🌸",
+        title="Reputation & Profile",
+        blurb=(
+            "> Kind words raise your standing; cruel ones wither it.\n"
+            "> Rosarium reads chat for the words staff have listed — open to **everyone**."
+        ),
+        color=ROSE,
+        fields=[
+            (
+                "🌸  Reputation",
+                f"`{p}rep [@user]` {DIV} reputation, standing and rank. Alias: `{p}reputation`\n"
+                f"┗ `{p}rep check [@user]` does the same\n"
+                f"`{p}rep leaderboard` {DIV} the ten most esteemed in the server. Aliases: `{p}rep lb` `{p}rep top`\n"
+                f"┣ A good word is **+1**, a bad word **−1** — at most one change per message\n"
+                f"┗ *10s cooldown per member. Command messages and bots never count.*",
+            ),
+            (
+                "🪪  Profile",
+                f"`{p}profile [@user]` {DIV} a profile card with their\n"
+                f"┣ **Petals** and petal rank\n"
+                f"┣ **Reputation**, rank and standing\n"
+                f"┗ Join date, account age and top role",
+            ),
+            (
+                "🏷️  Standings",
+                "🌹 **Beloved** 250+ · 🌸 **Cherished** 100+ · 🌷 **Welcome Guest** 25+\n"
+                "🍃 **Unnoticed** −24 to 24 · 🥀 **Withering** −99 to −25 · 🗡️ **Thorned** −100 or lower",
+            ),
+            (
+                "🔴  Word lists · Mod role, administrators or owner",
+                f"`{p}rep addgood <word>` {DIV} a word that earns reputation\n"
+                f"`{p}rep addbad <word>` {DIV} a word that costs reputation\n"
+                f"`{p}rep removegood <word>` · `{p}rep removebad <word>` {DIV} take one off a list\n"
+                f"`{p}rep words` {DIV} show both lists\n"
+                f"┣ Phrases work (`{p}rep addgood thank you`). Matching is whole-word and ignores case\n"
+                f"┗ *Use the slash forms (`/reputation addbad`) for bad words — replies are private, "
+                f"and prefix commands delete your message where they can.*",
             ),
         ],
     )
@@ -280,14 +330,16 @@ def build_pages(bot: commands.Bot) -> list[Page]:
         emoji="🎲",
         title="Casino",
         blurb=(
-            "> Every game pays out in petals. **Max bet: 250,000.**\n"
+            "> Every game pays out in petals. **Max bet: 250,000** "
+            "(100,000 for wheel, fish and slots).\n"
             "> Rosarium is not responsible for your decisions."
         ),
         color=EMBER,
         fields=[
             (
                 "🪙  Quick bets",
-                f"`{p}coinflip <amount> [h/t]` {DIV} straight 50/50, defaults to heads. Alias: `{p}cf` *(8s)*\n"
+                f"`{p}coinflip <amount> [petal/thorn]` {DIV} straight 50/50, defaults to petal. "
+                f"`h`/`t` work too. Alias: `{p}cf` *(8s)*\n"
                 f"`{p}dice <amount> <n1> <n2>` {DIV} call both dice before the roll. Alias: `{p}d` *(10s)*\n"
                 f"┗ One match **+1×** · both **+2×** · neither **−1×**",
             ),
@@ -296,7 +348,7 @@ def build_pages(bot: commands.Bot) -> list[Page]:
                 f"`{p}spinwheel <amount>` {DIV} the wheel, from **−4×** to **+4×**. Aliases: `{p}sw` `{p}spin` *(10s)*\n"
                 f"`{p}fish <amount>` {DIV} trash **−4×** through legendary catch **+4×** *(10s)*\n"
                 f"`{p}slots <amount>` {DIV} three reels. Alias: `{p}slot` *(8s)*\n"
-                f"┗ 🌙🌙🌙 pays **10×** · 💎 **5×** · any two matching **0.5×**",
+                f"┗ 🌹🌹🌹 pays **10×** · 💎 **5×** · any two matching **0.5×**",
             ),
             (
                 "🃏  Blackjack",
@@ -567,12 +619,16 @@ def build_pages(bot: commands.Bot) -> list[Page]:
             (
                 "🧪  Testing",
                 f"`{p}addmoney <amount> [@user]` {DIV} grant petals\n"
+                f"`{p}burnmoney <amount> [@user]` {DIV} remove petals\n"
                 f"`{p}welctest` {DIV} preview the welcome embed using yourself as the joiner",
             ),
         ],
     )
 
-    return [index, general, utility, timezone, fun, economy, casino, moderation, roles, snipe, setup, owner]
+    return [
+        index, general, utility, timezone, fun, economy, reputation,
+        casino, moderation, roles, snipe, setup, owner,
+    ]
 
 
 # Accepted arguments for `.help <section>` → page key.
@@ -592,6 +648,10 @@ CATEGORY_ALIASES = {
     "economy": "economy",
     "eco": "economy",
     "money": "economy",
+    "reputation": "reputation",
+    "rep": "reputation",
+    "profile": "reputation",
+    "profiles": "reputation",
     "casino": "casino",
     "gambling": "casino",
     "gamble": "casino",
