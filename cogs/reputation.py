@@ -3220,8 +3220,7 @@ BAD_WORDS = [
   "zipperhead",
   "zipperheads",
   "zoophile",
-  "zoophilia",
-  "🖕"
+  "zoophilia"
 ]
       
 
